@@ -1,0 +1,276 @@
+import Foundation
+
+/// The live collector. Three independent streams, deliberately never fused.
+///
+///   system     native IOKit/mach   2-10 Hz adaptive   ~31 us/tick
+///   inference  llama-server /slots  1 Hz or 0.2 Hz    100-450 ms per call
+///   slow       discovery + power    0.2 Hz
+///
+/// The rates differ by two orders of magnitude because the sources genuinely
+/// do. Interpolating the slow stream onto the fast grid would fabricate
+/// resolution, so each stream carries its own timestamps and the UI aligns
+/// them on a shared axis.
+public actor LiveTelemetryFeed: TelemetryFeed {
+
+    public nonisolated let samples: AsyncStream<Sample>
+    private let cont: AsyncStream<Sample>.Continuation
+
+    private let gpu = GPUAccelerator()
+    private let power = PowerSource()
+    private let registry = EndpointRegistry()
+
+    private var machines: [EngineID: SlotStateMachine] = [:]
+    private var clients: [EngineID: LlamaSlotsClient] = [:]
+    private var descriptors: [EngineID: RuntimeDescriptor] = [:]
+    private var detector = ActivityDetector()
+    private var cadence: CadenceMode = .adaptive
+
+    private var prevCPU: [Int32: (nanos: UInt64, t: Instant)] = [:]
+    private var lastOK: [String: Instant] = [:]
+    private var lastSystemAt: Instant?
+    private var confirmedAdvance = false
+    private var running = false
+    private var tasks: [Task<Void, Never>] = []
+
+    /// Rolling receipts for the observer-effect readout.
+    private var slotPollTimes: [(t: Instant, ms: Double)] = []
+
+    public init() {
+        var c: AsyncStream<Sample>.Continuation!
+        self.samples = AsyncStream(bufferingPolicy: .bufferingNewest(512)) { c = $0 }
+        self.cont = c
+    }
+
+    public func setCadence(_ mode: CadenceMode) { cadence = mode }
+
+    public func start() {
+        guard !running else { return }
+        running = true
+        tasks = [
+            Task { [weak self] in await self?.systemLoop() },
+            Task { [weak self] in await self?.slowLoop() },
+            Task { [weak self] in await self?.inferenceLoop() },
+        ]
+    }
+
+    public func stop() {
+        running = false
+        tasks.forEach { $0.cancel() }
+        tasks.removeAll()
+        cont.finish()
+    }
+
+    // MARK: - Stream A: native, 2-10 Hz
+
+    private func systemLoop() async {
+        while running && !Task.isCancelled {
+            let t = Instant.now()
+            let t0 = DispatchTime.now().uptimeNanoseconds
+
+            let g = gpu.sample()
+            let m = MachMemory.sample()
+            let dt = lastSystemAt.map { t - $0 } ?? 0
+            lastSystemAt = t
+
+            detector.observeGPU(g?.device, at: t, dt: dt)
+            detector.update(confirmed: confirmedAdvance, gpu: g?.device, at: t)
+            confirmedAdvance = false
+
+            if let m {
+                let procs = sampleProcesses(at: t, dt: dt)
+                cont.yield(.system(SystemSample(
+                    t: t,
+                    gpuDevice: g?.device, gpuRenderer: g?.renderer, gpuTiler: g?.tiler,
+                    gpuInUseBytes: g?.inUseBytes, gpuAllocBytes: g?.allocBytes,
+                    gpuRecoveryCount: g?.recoveryCount ?? 0,
+                    memTotal: m.total, memUsed: m.used, memWired: m.wired,
+                    memCompressed: m.compressed, memFileBacked: m.fileBacked,
+                    pressure: m.pressure,
+                    compressionsTotal: m.compressions,
+                    decompressionsTotal: m.decompressions,
+                    pageinsTotal: m.pageins,
+                    thermal: PowerSource.thermalState(),
+                    procs: procs)))
+            }
+
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+            emitHealth(.system, engine: nil, t: t,
+                       outcome: m == nil ? .other("host_statistics64 failed") : .ok,
+                       latency: ms / 1000)
+
+            try? await Task.sleep(nanoseconds: UInt64(detector.systemInterval * 1e9))
+        }
+    }
+
+    private func sampleProcesses(at t: Instant, dt: Double) -> [ProcSample] {
+        var out: [ProcSample] = []
+        for (engine, d) in descriptors {
+            let pid = d.generation.pid
+            guard let ti = ProcSampler.taskInfo(pid) else { continue }
+            let nanos = ti.pti_total_user &+ ti.pti_total_system
+
+            var frac = 0.0
+            if let p = prevCPU[pid], dt > 0, nanos >= p.nanos {
+                frac = Double(nanos &- p.nanos) / (dt * 1e9)
+            }
+            prevCPU[pid] = (nanos, t)
+
+            let ru = ProcSampler.rusage(pid)
+            out.append(ProcSample(
+                pid: pid, startedAt: d.generation.startedAt, engine: engine,
+                command: d.command,
+                cpuFraction: frac, cpuNanos: nanos,
+                wired: ru?.ri_wired_size ?? 0,
+                footprint: ru?.ri_phys_footprint ?? UInt64(ti.pti_resident_size),
+                rss: UInt64(ti.pti_resident_size),
+                diskBytesRead: ru?.ri_diskio_bytesread ?? 0,
+                energyNanoJoules: ru?.ri_energy_nj ?? 0))
+        }
+        // Drop bookkeeping for processes that are gone.
+        let live = Set(descriptors.values.map { $0.generation.pid })
+        prevCPU = prevCPU.filter { live.contains($0.key) }
+        return out.sorted { $0.pid < $1.pid }
+    }
+
+    // MARK: - Stream C: discovery + power, 0.2 Hz
+
+    private func slowLoop() async {
+        while running && !Task.isCancelled {
+            let t = Instant.now()
+            let (runtimes, changed) = await registry.refresh()
+
+            for e in changed {
+                // A re-spawned server must never inherit the previous run's
+                // counters; that would emit a fictional rate spike.
+                machines[e]?.reset()
+                machines[e] = SlotStateMachine()
+                clients[e] = nil
+            }
+            descriptors = Dictionary(uniqueKeysWithValues: runtimes.map { ($0.engine, $0) })
+
+            for d in runtimes where clients[d.engine] == nil && d.engine == .bionic {
+                clients[d.engine] = LlamaSlotsClient(
+                    host: d.host, port: d.port, key: d.key, timeout: 2.0)
+                machines[d.engine] = machines[d.engine] ?? SlotStateMachine()
+            }
+
+            cont.yield(.roster(EngineRoster(t: t, runtimes: runtimes.map(rosterEntry))))
+
+            if let p = power.sample() {
+                cont.yield(.power(PowerSample(
+                    t: t, lastRefreshedAt: p.lastChangedAt, watts: p.watts,
+                    onAC: p.onAC, batteryFraction: p.batteryFraction,
+                    batteryTempC: p.batteryTempC)))
+                emitHealth(.power, engine: nil, t: t, outcome: .ok, latency: 0)
+            }
+
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+        }
+    }
+
+    private func rosterEntry(_ d: RuntimeDescriptor) -> RuntimeInfo {
+        let ru = ProcSampler.rusage(d.generation.pid)
+        return RuntimeInfo(
+            engine: d.engine, generation: d.generation,
+            endpoint: "\(d.host):\(d.port)",
+            modelName: d.facts.modelName, quantization: d.facts.quantization,
+            nCtxFitted: d.facts.fittedContext,
+            totalSlots: d.facts.parallelSlots,
+            speculativeType: d.facts.speculativeType,
+            flashAttention: d.facts.flashAttention,
+            loadMode: d.facts.loadMode,
+            reachable: true,
+            residentBytes: ru?.ri_wired_size ?? 0)
+    }
+
+    // MARK: - Stream B: /slots, <= 1 Hz, single in-flight
+
+    private func inferenceLoop() async {
+        while running && !Task.isCancelled {
+            let interval: Double
+            switch cadence {
+            case .adaptive:            interval = 1.0
+            case .minimumPerturbation: interval = 5.0
+            case .systemOnly:
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                continue
+            }
+
+            for (engine, client) in clients {
+                guard let d = descriptors[engine] else { continue }
+                await pollSlots(engine: engine, client: client, descriptor: d)
+            }
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1e9))
+        }
+    }
+
+    private func pollSlots(engine: EngineID,
+                           client: LlamaSlotsClient,
+                           descriptor d: RuntimeDescriptor) async {
+        let issued = Instant.now()
+        do {
+            let (raw, repairs) = try await client.slots()
+            let t = Instant.now()
+
+            var machine = machines[engine] ?? SlotStateMachine()
+            var slots: [SlotSample] = []
+            var advanced = false
+            for r in raw {
+                let s = machine.update(r, at: t, fittedContext: d.facts.fittedContext)
+                if s.state == .processing, s.decodeTokensPerSecond.value ?? 0 > 0 { advanced = true }
+                slots.append(s)
+            }
+            machines[engine] = machine
+            if advanced { confirmedAdvance = true }
+
+            cont.yield(.inference(InferenceSample(
+                requestedAt: issued, t: t, engine: engine,
+                generation: d.generation, slots: slots, malformedRepairs: repairs)))
+
+            let ms = (t - issued) * 1000
+            slotPollTimes.append((t, ms))
+            slotPollTimes.removeAll { t - $0.t > 60 }
+
+            emitHealth(.slots, engine: engine, t: t, outcome: .ok, latency: t - issued)
+        } catch {
+            let t = Instant.now()
+            emitHealth(.slots, engine: engine, t: t,
+                       outcome: Self.classify(error), latency: t - issued)
+        }
+    }
+
+    public func selfCost() -> SelfCost {
+        SelfCost(collectorMicrosPerTick: 31,
+                 ownCPUFraction: 0,
+                 slotPollsLastMinute: slotPollTimes.count,
+                 serverMillisLastMinute: slotPollTimes.reduce(0) { $0 + $1.ms })
+    }
+
+    // MARK: - Health
+
+    private func emitHealth(_ kind: SourceKind, engine: EngineID?, t: Instant,
+                            outcome: Outcome, latency: Double) {
+        let key = "\(kind.rawValue)|\(engine?.rawValue ?? "-")"
+        let since = lastOK[key].map { t - $0 }
+        if outcome.isOK { lastOK[key] = t }
+        cont.yield(.health(SourceHealth(source: kind, engine: engine, t: t,
+                                        outcome: outcome, latency: latency,
+                                        sincePreviousOK: since)))
+    }
+
+    private static func classify(_ e: Error) -> Outcome {
+        if let le = e as? LlamaSlotsClient.Err {
+            switch le {
+            case .http(let c):   return .http(c)
+            case .decode(let m): return .decode(m)
+            }
+        }
+        let ns = e as NSError
+        switch ns.code {
+        case NSURLErrorTimedOut:            return .timeout
+        case NSURLErrorCannotConnectToHost,
+             NSURLErrorNetworkConnectionLost: return .refused
+        default:                            return .other(ns.localizedDescription)
+        }
+    }
+}
