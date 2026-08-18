@@ -80,7 +80,8 @@ final class SlotStateMachineTests: XCTestCase {
                          cached: 0, decoded: 5), at: Instant(0), fittedContext: 16_384)
         var s = m.update(raw(processing: true, idTask: 3, npt: 100, processed: 100,
                              cached: 0, decoded: 5), at: Instant(3), fittedContext: 16_384)
-        XCTAssertTrue(s.decodeTokensPerSecond.confidence.isAvailable || s.decodeTokensPerSecond.value != nil)
+        XCTAssertNotEqual(s.decodeTokensPerSecond.confidence.reason,
+                          "slot stalled — n_decoded frozen", "3 s is not yet a stall")
         s = m.update(raw(processing: true, idTask: 3, npt: 100, processed: 100,
                          cached: 0, decoded: 5), at: Instant(9), fittedContext: 16_384)
         XCTAssertEqual(s.decodeTokensPerSecond.confidence.reason, "slot stalled — n_decoded frozen")
@@ -228,5 +229,62 @@ final class ContextFillTests: XCTestCase {
         XCTAssertEqual(c.tokens, 17_460)
         XCTAssertNil(c.fractionOfFitTarget)
         XCTAssertFalse(c.exceededFitTarget)
+    }
+}
+
+/// MEASURED 2026-08-18 against the live server: during prefill,
+/// `next_token[0].n_decoded` holds the PREVIOUS request's value. Observed
+/// reading 370 for 23 s while n_prompt_tokens_processed climbed 42 -> 1300,
+/// then resetting to 7 the moment decode began. Publishing a rate from that
+/// window produced a confident, entirely fictional "12.4 tok/s".
+final class PrefillStaleDecodeTests: XCTestCase {
+
+    func slot(processing: Bool, idTask: Int, processed: Int, decoded: Int)
+        -> LlamaSlotsClient.RawSlot {
+        LlamaSlotsClient.RawSlot(
+            id: 1, isProcessing: processing, nCtx: 262_144, speculative: true,
+            idTask: idTask, nPromptTokens: processed, nPromptTokensProcessed: processed,
+            nPromptTokensCache: 0, nDecoded: decoded, nRemain: -1,
+            hasNextToken: processing, sampler: nil, specTypes: "none,draft-mtp",
+            hasCounters: true)
+    }
+
+    func testStaleDecodedDuringPrefillIsNeverPublishedAsARate() {
+        var m = SlotStateMachine()
+        // The real trace: prompt processing advances, n_decoded frozen at 370.
+        var last: SlotSample!
+        for (i, pp) in [42, 788, 1_300].enumerated() {
+            last = m.update(slot(processing: true, idTask: 9_001, processed: pp, decoded: 370),
+                            at: Instant(Double(i) * 8), fittedContext: 16_384)
+            XCTAssertEqual(last.state, .prefilling, "busy but not yet decoding")
+            XCTAssertNil(last.nDecoded, "the stale counter must not be surfaced")
+            XCTAssertFalse(last.decodeTokensPerSecond.confidence.isAvailable)
+        }
+        XCTAssertEqual(last.decodeTokensPerSecond.confidence.reason,
+                       "prefilling — n_decoded still holds the previous request's value")
+
+        // Decode begins: the counter resets to a small value.
+        let a = m.update(slot(processing: true, idTask: 9_001, processed: 1_304, decoded: 7),
+                         at: Instant(24), fittedContext: 16_384)
+        XCTAssertEqual(a.state, .processing)
+        XCTAssertEqual(a.nDecoded, 7)
+
+        // ...and only now does a rate become derivable.
+        var b: SlotSample!
+        for (i, d) in [13, 20, 25].enumerated() {
+            b = m.update(slot(processing: true, idTask: 9_001, processed: 1_304, decoded: d),
+                         at: Instant(25.5 + Double(i) * 1.5), fittedContext: 16_384)
+        }
+        XCTAssertEqual(b.state, .processing)
+        XCTAssertNotNil(b.decodeTokensPerSecond.value)
+        XCTAssertEqual(b.decodeTokensPerSecond.value!, 4.0, accuracy: 1.5)
+    }
+
+    func testPrefillingCountsAsBusySoTheUIShowsAGeneration() {
+        var m = SlotStateMachine()
+        let s = m.update(slot(processing: true, idTask: 1, processed: 500, decoded: 999),
+                         at: Instant(0), fittedContext: 16_384)
+        XCTAssertTrue(s.state.isBusy)
+        XCTAssertEqual(s.state, .prefilling)
     }
 }

@@ -145,7 +145,7 @@ final class TelemetryHub {
 
     /// The active slot across all engines, if any.
     var activeSlot: SlotSample? {
-        latestInference?.slots.first { $0.state == .processing }
+        latestInference?.slots.first { $0.state.isBusy }
     }
 
     var isGenerating: Bool { activeSlot != nil }

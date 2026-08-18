@@ -22,6 +22,16 @@ public struct SlotStateMachine: Sendable {
         var lastAdvanceAt: Instant?
         var prefillProcessed: Int?
         var prefillCached: Int?
+        /// n_decoded is only trustworthy once we have seen it reset for THIS
+        /// request. Until then it is the previous request's leftover.
+        var decodeTrusted = false
+        var lastProcessed: Int?
+        /// Last time ANY counter moved. A busy slot where neither prompt
+        /// processing nor decoding advances is stuck, and must be shown as
+        /// stuck rather than averaged into throughput -- during prefill just
+        /// as much as during decode.
+        var lastAnyAdvanceAt: Instant?
+        var lastPromptTokens: Int?
     }
 
     /// Seconds of history used for the least-squares decode-rate slope.
@@ -43,35 +53,66 @@ public struct SlotStateMachine: Sendable {
                                 fittedContext: Int?) -> SlotSample {
 
         // ---- classify. The three payload shapes are genuinely different. ----
-        let state: SlotState
-        if raw.isProcessing            { state = .processing }
-        else if raw.hasCounters        { state = .idleWithHistory }
-        else                           { state = .neverUsed }
-
         var tr = tracks[raw.id] ?? Track()
 
-        // ---- request boundary ----
+        // ---- request boundary (before anything derived) ----
         let boundary = (raw.idTask != tr.idTask) && raw.idTask != nil
-        if state == .processing && (boundary || tr.firstSeenActive == nil) {
+        if raw.isProcessing && (boundary || tr.firstSeenActive == nil) {
             let priorIdle = tr.lastIdleObservation
             tr = Track()
             tr.idTask = raw.idTask
             tr.firstSeenActive = t
             tr.lastIdleObservation = priorIdle
         }
-        if state != .processing {
+
+        // ---- is n_decoded trustworthy yet? ----
+        // It is NOT reset at request start; it holds the previous request's
+        // value for the whole of prefill. Two signals say decode has begun:
+        // the counter finally dropping, or prompt processing having stopped
+        // while the counter climbs from a low base.
+        if raw.isProcessing, raw.idTask == tr.idTask, let d = raw.nDecoded, !tr.decodeTrusted {
+            if let last = tr.lastDecoded, d < last {
+                tr.decodeTrusted = true
+                tr.lastDecoded = nil
+                tr.window.removeAll()
+            } else if let lp = tr.lastProcessed,
+                      raw.nPromptTokensProcessed == lp,
+                      let last = tr.lastDecoded, d > last, d < 64 {
+                tr.decodeTrusted = true
+            }
+        }
+        if raw.isProcessing {
+            let moved = raw.nPromptTokensProcessed != tr.lastProcessed
+                || raw.nPromptTokens != tr.lastPromptTokens
+                || (tr.decodeTrusted && raw.nDecoded != tr.lastDecoded)
+            if moved || tr.lastAnyAdvanceAt == nil { tr.lastAnyAdvanceAt = t }
+        }
+        tr.lastProcessed = raw.nPromptTokensProcessed
+        tr.lastPromptTokens = raw.nPromptTokens
+        if !tr.decodeTrusted { tr.lastDecoded = raw.nDecoded }
+
+        // ---- classify (three payload shapes, plus the prefill phase) ----
+        let state: SlotState
+        if raw.isProcessing {
+            state = tr.decodeTrusted ? .processing : .prefilling
+        } else if raw.hasCounters {
+            state = .idleWithHistory
+        } else {
+            state = .neverUsed
+        }
+
+        if !state.isBusy {
             tr.lastIdleObservation = t
             if state == .idleWithHistory { tr.idTask = raw.idTask }
         }
 
-        // ---- accumulate, only while genuinely active on the same task ----
+        // ---- accumulate, only while genuinely decoding on the same task ----
         var stalled = false
+        if state.isBusy, let la = tr.lastAnyAdvanceAt, t - la > stallSeconds { stalled = true }
         if state == .processing, raw.idTask == tr.idTask, let d = raw.nDecoded {
             if let last = tr.lastDecoded, d < last {
-                // Counter went backwards without an observed boundary: the slot
-                // was reused between polls. Discard rather than emit a negative.
-                tr = Track()
-                tr.idTask = raw.idTask
+                // Reused between polls without an observed boundary.
+                tr.window.removeAll()
                 tr.firstSeenActive = t
             }
             if tr.firstTokenAt == nil && d > 0 { tr.firstTokenAt = t }
@@ -84,7 +125,6 @@ public struct SlotStateMachine: Sendable {
 
             if let la = tr.lastAdvanceAt, t - la > stallSeconds { stalled = true }
 
-            // Prefill counters freeze once prefill ends; latch the first sight.
             if tr.prefillProcessed == nil { tr.prefillProcessed = raw.nPromptTokensProcessed }
             if tr.prefillCached == nil { tr.prefillCached = raw.nPromptTokensCache }
         }
@@ -93,6 +133,8 @@ public struct SlotStateMachine: Sendable {
 
         // ---- derive ----
         let decodeRate = Self.slope(tr.window, stalled: stalled, state: state)
+        // Never surface the stale counter.
+        let trustedDecoded = tr.decodeTrusted ? raw.nDecoded : nil
         let ttft = Self.ttftInterval(tr)
         let prefill = Self.prefillRate(tr, state: state)
         let cache = Self.cacheHitRate(processed: raw.nPromptTokensProcessed,
@@ -106,7 +148,7 @@ public struct SlotStateMachine: Sendable {
             nPromptTokens: raw.nPromptTokens,
             nPromptTokensProcessed: raw.nPromptTokensProcessed,
             nPromptTokensCache: raw.nPromptTokensCache,
-            nDecoded: raw.nDecoded, nRemain: raw.nRemain,
+            nDecoded: trustedDecoded, nRemain: raw.nRemain,
             hasNextToken: raw.hasNextToken, sampler: raw.sampler,
             decodeTokensPerSecond: decodeRate,
             prefillTokensPerSecond: prefill,
@@ -122,6 +164,10 @@ public struct SlotStateMachine: Sendable {
     /// error against a 1 s poll. The regression collapses that; the raw points
     /// still go to the UI for the trace.
     static func slope(_ pts: [Point], stalled: Bool, state: SlotState) -> Estimate<Double> {
+        if stalled { return .unavailable("slot stalled — n_decoded frozen") }
+        if state == .prefilling {
+            return .unavailable("prefilling — n_decoded still holds the previous request's value")
+        }
         if state != .processing { return .unavailable("slot is not generating") }
         if stalled { return .unavailable("slot stalled — n_decoded frozen") }
         guard pts.count >= 2 else { return .unavailable("need 2 samples") }

@@ -40,7 +40,7 @@ struct SlotCard: View {
                         MetricTile(label: "TTFT", value: Fmt.dash, tint: T.inkDisabled)
                     }
                 }
-            case .idleWithHistory, .processing:
+            case .idleWithHistory, .prefilling, .processing:
                 VStack(alignment: .leading, spacing: 12) {
                     ContextCompositionBar(slot: slot)
                     HStack(alignment: .top, spacing: T.padSection) {
@@ -61,9 +61,9 @@ struct SlotCard: View {
                         }
                         Spacer()
                     }
-                    if let s = slot.sampler { SamplerGrid(params: s, live: slot.state == .processing) }
+                    if let s = slot.sampler { SamplerGrid(params: s, live: slot.state.isBusy) }
                 }
-                .opacity(slot.state == .processing ? 1 : 0.62)
+                .opacity(slot.state.isBusy ? 1 : 0.62)
                 .background(alignment: .topLeading) {
                     if slot.state == .idleWithHistory {
                         Hatch(spacing: 8).stroke(T.hatchStale, lineWidth: 1)
@@ -77,7 +77,8 @@ struct SlotCard: View {
         switch slot.state {
         case .neverUsed:       return "NEVER USED"
         case .idleWithHistory: return "IDLE · counters frozen" + (slot.idTask.map { " · last id_task \($0)" } ?? "")
-        case .processing:      return "PROCESSING" + (slot.idTask.map { " · id_task \($0)" } ?? "")
+        case .prefilling:      return "PREFILLING · computing the prompt" + (slot.idTask.map { " · id_task \($0)" } ?? "")
+        case .processing:      return "DECODING" + (slot.idTask.map { " · id_task \($0)" } ?? "")
         }
     }
 }

@@ -191,7 +191,16 @@ public enum SlotState: String, Sendable {
     case neverUsed
     /// Exposes counters FROZEN from its last request. Must never render as live.
     case idleWithHistory
+    /// Computing the prompt. MEASURED: `next_token[0].n_decoded` is NOT reset at
+    /// request start -- it holds the PREVIOUS request's value for the whole of
+    /// prefill (observed reading 370 for 23 s while the prompt was still being
+    /// processed, then resetting to 7 once decode began). Any rate derived from
+    /// it during this phase is fiction, so nDecoded is published as nil here.
+    case prefilling
     case processing
+
+    /// Prefilling and processing are both "the slot is busy".
+    public var isBusy: Bool { self == .prefilling || self == .processing }
 }
 
 public struct SamplerParams: Sendable, Equatable {

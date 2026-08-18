@@ -20,7 +20,7 @@ open -a "AI Activity"   # or Cmd-Space "AI Activity"
 Headline metric: **joules per token** = system watts ÷ emitted tok/s, with the
 idle floor subtracted so you can see the marginal cost of inference.
 
-## The five traps this was built around
+## The six traps this was built around
 
 Each of these silently produces a plausible, wrong number. All are covered by
 tests in `Tests/TelemetryTests`.
@@ -44,6 +44,14 @@ tests in `Tests/TelemetryTests`.
    rather than hiding it.
 5. **`/slots` emits raw control bytes inside JSON strings**, hard-failing
    `JSONDecoder`. `LenientJSON` repairs them and counts the repairs.
+6. **`n_decoded` is not reset at request start.** Through the whole of prefill
+   it holds the *previous* request's final count. Measured: it read `400` — the
+   exact token count of the preceding run — for 14 s while
+   `n_prompt_tokens_processed` climbed 1106 → 1618 and the client had received
+   nothing, then reset to `11` the moment decode began. Deriving a rate from
+   that window produced a confident, entirely fictional "12.4 tok/s". Slots are
+   therefore classified `.prefilling` until the counter is proven trustworthy,
+   and `nDecoded` is published as `nil` until then.
 
 ## Design rules
 
@@ -69,6 +77,38 @@ tests in `Tests/TelemetryTests`.
 | Combined collector tick | **30.6 µs → 0.03% of one core at 10 Hz** |
 | App, window visible | ~8% of one core |
 | App, window occluded | ~3.4% of one core |
+
+## Validating the app against ground truth
+
+`tools/testrun.py` fires a controlled prompt and reports the **real** TTFT and
+token count, because it *is* the client — something the app can never be. Use it
+to check the app rather than trusting it.
+
+```sh
+./tools/testrun.py --prompt cold      # long novel prompt: big prefill
+./tools/testrun.py --prompt regular   # low-entropy, speculation should thrive
+./tools/testrun.py --prompt entropy   # high-entropy, speculation should struggle
+```
+
+`regular` and `entropy` are a matched pair: same shape, same token budget,
+deliberately different predictability. Since `/slots` exposes no accept/reject
+counters, the tok/s difference between them is the only observable signature of
+speculative decoding available.
+
+Measured 2026-08-18 on Qwen3.8-27B-Q5_K_M (M2 Max, on AC):
+
+| run | TTFT | decode |
+|---|---|---|
+| regular (predictable table) | 13.56 s (cold buffers) | **8.72 tok/s** |
+| entropy (novel prose) | 1.42 s | **7.90 tok/s** |
+| cold (4.5k-token prompt, cache miss) | **55.4 s** | 4.62 tok/s |
+| cold (same prompt, cache hit) | **1.19 s** | 10.28 tok/s |
+
+The last two rows are the same prompt: prompt-cache reuse turned a 55 s wait into
+1.2 s, a **47x** difference. That is what the cache-reuse bar in the Slots view is
+measuring. The 10% gap between `regular` and `entropy` is suggestive of draft
+acceptance varying with predictability, but it is a single pair with a cold first
+run — treat it as a hypothesis to replicate, not a result.
 
 `swift run -c release telemetry-probe --cost` asserts the collector budget and
 fails on regression. `--live`, `--discover` and `--power` run the collectors
