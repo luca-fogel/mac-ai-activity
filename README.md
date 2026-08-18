@@ -106,9 +106,35 @@ Measured 2026-08-18 on Qwen3.8-27B-Q5_K_M (M2 Max, on AC):
 
 The last two rows are the same prompt: prompt-cache reuse turned a 55 s wait into
 1.2 s, a **47x** difference. That is what the cache-reuse bar in the Slots view is
-measuring. The 10% gap between `regular` and `entropy` is suggestive of draft
-acceptance varying with predictability, but it is a single pair with a cold first
-run — treat it as a hypothesis to replicate, not a result.
+measuring.
+
+### Replication of the regular-vs-entropy pair
+
+`tools/abtest.py` runs the pair counterbalanced and repeated, because the first
+attempt was confounded — `regular` ran first on cold GPU buffers.
+
+Two blocks of 6 alternating trials (12 runs, 300 tokens each), block 2 starting
+with the opposite condition:
+
+| | regular | entropy | raw difference | verdict |
+|---|---|---|---|---|
+| block 1 | 7.87 ± 0.70 | 7.32 ± 0.79 | +7.6% | within noise |
+| block 2 | 7.63 ± 0.39 | 7.42 ± 0.27 | +2.8% | within noise |
+| pooled, detrended | +0.152 | −0.152 | **+4.0%** | p = 0.024 (exact permutation, n=6 each) |
+
+**Neither block replicates on its own.** Run-to-run drift is the dominant term:
+block 1 fell **−0.37 tok/s per run (−22% over six runs)** while block 2 was flat
+(+0.09), so the drift is a settling artifact of the preceding cold runs rather
+than a general law. It is 5x larger than the effect being measured, which is
+why the original uncounterbalanced pair was almost certainly measuring drift.
+
+Pooling both blocks with within-block detrending, `regular` is 4.0% faster and
+an exact permutation test gives p = 0.024. Three caveats keep this modest:
+the detrending was chosen *after* seeing the drift; a single prompt pair
+confounds predictability with format (a numeric table vs prose, which differ in
+tokenization as well as entropy); and 4% is small next to the 22% drift. Treat
+it as a directional result that survived one replication attempt, not a
+measurement of draft acceptance.
 
 `swift run -c release telemetry-probe --cost` asserts the collector budget and
 fails on regression. `--live`, `--discover` and `--power` run the collectors
