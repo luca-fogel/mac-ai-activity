@@ -175,12 +175,18 @@ public struct PowerSample: Sendable {
     public var batteryFraction: Double?
     /// Battery sensor, NOT SoC die temperature. Labelled as such in the UI.
     public var batteryTempC: Double?
+    /// Monotonic raw energy accumulator, for true integration over an interval.
+    public var accumulatedEnergy: UInt64?
+    /// Which key the wattage came from, so the UI can be specific about it.
+    public var source: String?
 
     public init(t: Instant, lastRefreshedAt: Instant, watts: Estimate<Double>,
-                onAC: Bool, batteryFraction: Double?, batteryTempC: Double?) {
+                onAC: Bool, batteryFraction: Double?, batteryTempC: Double?,
+                accumulatedEnergy: UInt64? = nil, source: String? = nil) {
         self.t = t; self.lastRefreshedAt = lastRefreshedAt; self.watts = watts
         self.onAC = onAC; self.batteryFraction = batteryFraction
         self.batteryTempC = batteryTempC
+        self.accumulatedEnergy = accumulatedEnergy; self.source = source
     }
 }
 

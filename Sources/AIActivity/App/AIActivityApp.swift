@@ -16,7 +16,11 @@ struct AIActivityApp: App {
                     // A real .app gets live data; `swift run` in a sandbox or
                     // with no engines present falls back to the mock so the UI
                     // is always inspectable.
-                    if ProcessInfo.processInfo.environment["AIACTIVITY_MOCK"] != nil {
+                    // Diagnostic: attach nothing, to separate SwiftUI's own
+                    // compositing cost from anything the app actually does.
+                    if ProcessInfo.processInfo.environment["AIACTIVITY_NOFEED"] != nil {
+                        // no feed attached
+                    } else if ProcessInfo.processInfo.environment["AIACTIVITY_MOCK"] != nil {
                         hub.attach(MockFeed())
                     } else {
                         hub.attach(LiveTelemetryFeed())

@@ -76,9 +76,20 @@ final class TelemetryHub {
         }
         flusher?.cancel()
         flusher = Task { [weak self] in
-            // 20 Hz ceiling on redraws, regardless of arrival pattern.
+            // Adaptive REDRAW rate. Sampling is unaffected -- the ring buffers
+            // still fill at the collectors' full rate, so no history is lost.
+            // Only how often SwiftUI re-lays-out the window changes.
+            //
+            // Measured: collectors 0.40% of one core, a static window 0.20%,
+            // and a live window ~9.8%. The cost is per-redraw layout work, so
+            // this is the only lever that matters. Idle redraws at 1 Hz (Activity
+            // Monitor's own cadence); generating redraws at 5 Hz. Measured: 10 Hz
+            // display cost 16.7% of a core, 5 Hz ~8%, 1 Hz 2.3%.
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 100_000_000)
+                let hz: UInt64 = await MainActor.run { [weak self] in
+                    (self?.isGenerating ?? false) ? 200_000_000 : 1_000_000_000
+                }
+                try? await Task.sleep(nanoseconds: hz)
                 guard let self else { break }
                 self.flush()
             }
@@ -121,7 +132,12 @@ final class TelemetryHub {
             gpuSeries.append(t: v.t.s, v.gpuDevice)
             sysTimes = gpuSeries.times
             pending.system = v
+            tracker.noteGPU(v.gpuDevice, at: v.t)
+            refreshEpisodes(at: v.t)
         case .inference(let v):
+            if let busy = v.slots.first(where: { $0.state == .processing }) {
+                tracker.noteTokens(busy.nDecoded, prefillEnded: v.t)
+            }
             rateSeries.append(t: v.t.s,
                               v.slots.first { $0.state == .processing }?
                                      .decodeTokensPerSecond.value)
@@ -133,6 +149,7 @@ final class TelemetryHub {
         case .power(let v):
             wattSeries.append(t: v.t.s, v.watts.value)
             pending.power = v
+            tracker.noteWatts(v.watts.value, at: v.t)
         case .roster(let v):
             pending.roster = v.runtimes
         case .health(let h):
@@ -179,6 +196,26 @@ final class TelemetryHub {
     /// Whole-system watts minus the idle floor: the marginal cost of inference.
     /// Far more interesting than total draw, and invisible without a baseline.
     @ObservationIgnored private(set) var idleWattsFloor: Double?
+    @ObservationIgnored private var tracker = EpisodeTracker()
+    // Ignored, like the ring buffers: these change at 10 Hz and would otherwise
+    // invalidate every view on every sample, defeating the coalescing flusher.
+    // Views depend on `revision` (snapshot-backed) and read these through it.
+    @ObservationIgnored private(set) var episodes: [Episode] = []
+    @ObservationIgnored private(set) var currentEpisode: Episode?
+
+    /// Opens and closes episodes as work starts and stops. Uses the union of
+    /// signals, so an MLX generation (visible only as busy + GPU) is tracked
+    /// just as a llama.cpp one is.
+    private func refreshEpisodes(at t: Instant) {
+        let r = workingRuntime
+        tracker.note(generating: isGenerating,
+                     backend: r?.backend ?? "unknown",
+                     model: r?.modelName ?? "unknown",
+                     at: t)
+        let cur = tracker.current
+        if cur?.id != currentEpisode?.id { episodes = tracker.completed }
+        currentEpisode = cur
+    }
 
     func noteIdleFloor() {
         guard !isGenerating, let w = latestPower?.watts.value else { return }

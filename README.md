@@ -70,13 +70,30 @@ tests in `Tests/TelemetryTests`.
 
 ## Measured cost
 
+Sampling and display are separate concerns, and only one of them is expensive.
+
 | | |
 |---|---|
 | `GPUAccelerator.sample()` | **26.9 µs** (vs 3.3 ms for the whole IORegistry dict, 22 ms shelling `ioreg`) |
 | `MachMemory.sample()` | **3.7 µs** |
-| Combined collector tick | **30.6 µs → 0.03% of one core at 10 Hz** |
-| App, window visible | ~8% of one core |
-| App, window occluded | ~3.4% of one core |
+| Combined collector tick | **30.6 µs** |
+| **Whole collector feed, headless (no UI)** | **0.40% of one core** |
+| Window open, no data attached | 0.20% |
+| Window idle (1 Hz display) | **2.3%** |
+| Window during a generation (5 Hz display) | **11.4%** |
+| Window occluded | ~0 (display paused entirely) |
+
+The collection layer meets its budget with room to spare; essentially all the
+cost is SwiftUI re-laying-out the window, and it scales with the **display**
+rate, not the sample rate. So the display rate is adaptive — 1 Hz idle
+(Activity Monitor's own cadence), 5 Hz while generating — while **sampling stays
+at full rate regardless**, so no history is lost and nothing analytical is
+traded away. 10 Hz display was measured at 16.7% and judged not worth it.
+
+This matters less than it looks for perturbation: llama.cpp inference is
+GPU-bound and its own backend process uses ~0.2% CPU, so the app is not
+competing for the resource under test. The real perturbation risk is `/slots`
+polling, which is separately controlled in the Sources inspector.
 
 ## Validating the app against ground truth
 

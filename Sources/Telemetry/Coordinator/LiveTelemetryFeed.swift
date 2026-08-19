@@ -175,7 +175,8 @@ public actor LiveTelemetryFeed: TelemetryFeed {
                 cont.yield(.power(PowerSample(
                     t: t, lastRefreshedAt: p.lastChangedAt, watts: p.watts,
                     onAC: p.onAC, batteryFraction: p.batteryFraction,
-                    batteryTempC: p.batteryTempC)))
+                    batteryTempC: p.batteryTempC,
+                    accumulatedEnergy: p.accumulatedEnergy, source: p.source)))
                 emitHealth(.power, engine: nil, t: t, outcome: .ok, latency: 0)
             }
 

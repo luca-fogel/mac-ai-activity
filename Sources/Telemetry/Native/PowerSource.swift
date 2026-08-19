@@ -22,6 +22,12 @@ public final class PowerSource: @unchecked Sendable {
         public var batteryFraction: Double?
         public var batteryTempC: Double?
         public var lastChangedAt: Instant
+        /// Monotonic energy accumulator (raw units). Differencing this gives a
+        /// true integral over an interval, which beats sampling a slow-refresh
+        /// wattage and multiplying by dt.
+        public var accumulatedEnergy: UInt64?
+        /// How the wattage was obtained, so the UI can be specific.
+        public var source: String?
     }
 
     private var service: io_service_t = 0
@@ -47,26 +53,41 @@ public final class PowerSource: @unchecked Sendable {
         }
 
         let mV      = (dict["Voltage"] as? NSNumber)?.doubleValue
-        let mA      = (dict["InstantAmperage"] as? NSNumber)?.doubleValue
+        let mA      = (dict["InstantAmperage"] as? NSNumber).map { n -> Double in
+            // The key is published as an unsigned 64-bit value; discharge is
+            // negative and wraps. Reinterpret rather than reading 1.8e19.
+            let u = n.uint64Value
+            return u > (UInt64.max / 2) ? -Double(UInt64.max - u + 1) : Double(u)
+        }
         let onAC    = (dict["ExternalConnected"] as? Bool) ?? false
+
+        // PowerTelemetryData.SystemLoad is whole-system draw in mW and is the
+        // RIGHT quantity: it is the load, not the battery current, so unlike
+        // V x I it remains valid on AC. Verified against V x I on battery:
+        // 12.581 W vs 12.57 W.
+        let telem = dict["PowerTelemetryData"] as? [String: Any]
+        let systemLoadmW = (telem?["SystemLoad"] as? NSNumber)?.doubleValue
+        let accEnergy = (telem?["AccumulatedSystemEnergyConsumed"] as? NSNumber)?.uint64Value
         let cur     = (dict["CurrentCapacity"] as? NSNumber)?.doubleValue
         let max     = (dict["MaxCapacity"] as? NSNumber)?.doubleValue
         let tempRaw = (dict["Temperature"] as? NSNumber)?.doubleValue
 
         // Detect the ~4 s refresh so the UI can badge a held value.
-        let sig = "\(mV ?? -1)|\(mA ?? 0)|\(cur ?? -1)"
+        let sig = "\(mV ?? -1)|\(mA ?? 0)|\(cur ?? -1)|\(systemLoadmW ?? -1)|\(accEnergy ?? 0)"
         if sig != lastSignature { lastSignature = sig; lastChange = Instant.now() }
 
         let watts: Estimate<Double>
-        if onAC {
-            watts = .unavailable("on AC — battery amperage reflects charging, not load")
-        } else if let v = mV, let a = mA, a < 0 {
-            // Discharging: amperage is negative. Magnitude is system draw.
+        var source: String?
+        if let mw = systemLoadmW, mw > 0 {
+            watts = .high(mw / 1000)
+            source = "PowerTelemetryData.SystemLoad"
+        } else if !onAC, let v = mV, let a = mA, a < 0 {
             watts = .high(v * -a / 1_000_000)
-        } else if mA != nil {
-            watts = .unavailable("battery not discharging")
+            source = "Voltage x InstantAmperage"
+        } else if onAC {
+            watts = .unavailable("on AC and SystemLoad unavailable — battery amperage reflects charging, not load")
         } else {
-            watts = .unavailable("AppleSmartBattery reported no amperage")
+            watts = .unavailable("AppleSmartBattery reported no usable power telemetry")
         }
 
         return Stats(
@@ -74,7 +95,9 @@ public final class PowerSource: @unchecked Sendable {
             onAC: onAC,
             batteryFraction: (cur != nil && max != nil && max! > 0) ? cur! / max! : nil,
             batteryTempC: tempRaw.map { $0 / 100.0 },
-            lastChangedAt: lastChange)
+            lastChangedAt: lastChange,
+            accumulatedEnergy: accEnergy,
+            source: source)
     }
 
     /// Cheaper and more authoritative than parsing the battery dict for AC.

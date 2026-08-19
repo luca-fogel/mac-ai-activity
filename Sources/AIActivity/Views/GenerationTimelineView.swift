@@ -45,6 +45,10 @@ struct GenerationTimelineView: View {
         let gpuWin = hub.gpuSeries.window(window)
 
         VStack(alignment: .leading, spacing: 10) {
+            lane("Generation phases", trailing: phaseTrailing) {
+                PhaseBandLane(episodes: hub.episodes, current: hub.currentEpisode,
+                              axis: axis, window: window)
+            }
             lane("Token output", trailing: rateLabel) {
                 SparseTrack(points: tokenPoints, axis: axis,
                             domain: 0...max(10, tokenMax * 1.25),
@@ -67,6 +71,7 @@ struct GenerationTimelineView: View {
                 SampleRug(rows: rugRows, axis: axis)
             }
             axisRuler(axis)
+            EpisodesView()
         }
     }
 
@@ -132,6 +137,13 @@ struct GenerationTimelineView: View {
         }
         return String(format: "%.1f tok/s emitted", v)
             + (s.speculative ? " · speculative" : "")
+    }
+
+    private var phaseTrailing: String {
+        if let e = hub.currentEpisode {
+            return "\(e.backend) running \(String(format: "%.0f", hub.now - e.start))s"
+        }
+        return hub.episodes.isEmpty ? "no generations yet" : "idle"
     }
 
     private var memoryTrailing: String {
