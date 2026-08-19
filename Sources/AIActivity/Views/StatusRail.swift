@@ -78,9 +78,12 @@ struct StatusRail: View {
     @State private var cachedFacts: String = ""
 
     /// "idle" alone implied this was the only model. It is not.
+    /// Be explicit about WHY this model is the one on screen, because with
+    /// several resident there is no single right answer.
     private var stateWord: String {
         if hub.isGenerating { return "generating" }
-        return hub.lastBusyAt.isEmpty ? "idle" : "idle · last active"
+        if !hub.lastBusyAt.isEmpty { return "idle · last active" }
+        return hub.residentRuntimes.count > 1 ? "idle · most recently started" : "idle"
     }
 
     private var staticFacts: String {

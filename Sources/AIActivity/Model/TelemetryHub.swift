@@ -209,7 +209,15 @@ final class TelemetryHub {
         //    llama.cpp's 21 GB model no matter what you had actually been using.
         if let e = lastBusyAt.max(by: { $0.value < $1.value })?.key,
            let r = roster.first(where: { $0.engine == e }) { return r }
-        // 4. Nothing has run since launch: fall back to the largest resident.
+        // 4. Nothing has run since the app launched (and nothing is persisted,
+        //    by design). Prefer the most RECENTLY STARTED runtime: the server
+        //    you brought up last is the one you are working with. Ranking by
+        //    size instead meant llama.cpp's 29.5 GB always won and the header
+        //    sat on a model the user had stopped using.
+        let resident = roster.filter { $0.residentBytes > 1_000_000_000 }
+        if let newest = resident.max(by: {
+            ($0.generation?.startedAt ?? 0) < ($1.generation?.startedAt ?? 0)
+        }) { return newest }
         return roster.max { ($0.residentBytes, $0.engine.rawValue) < ($1.residentBytes, $1.engine.rawValue) }
     }
 
