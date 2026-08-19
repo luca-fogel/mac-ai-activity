@@ -58,7 +58,7 @@ struct GenerationHero: View {
     }
 
     private var marginalCaption: String? {
-        if let p = hub.latestPower, p.onAC { return "AC — metering unavailable" }
+        if let p = hub.latestPower, p.watts.value == nil { return p.watts.confidence.reason }
         guard let floor = hub.idleWattsFloor else { return nil }
         guard let m = hub.marginalWatts else {
             return String(format: "idle floor %.1f W", floor)

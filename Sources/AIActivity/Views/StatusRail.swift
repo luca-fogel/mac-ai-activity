@@ -109,10 +109,15 @@ struct StatusRail: View {
             label: "Power",
             value: p?.watts.value.map { Fmt.watts($0) } ?? Fmt.dash,
             tint: p?.watts.value == nil ? T.inkDisabled : T.inkPrimary,
-            caption: p == nil ? nil
-                : (p!.onAC ? "AC · metering unavailable"
-                           : (hub.marginalWatts.map { String(format: "+%.1f W vs idle", $0) }
-                              ?? "held \(String(format: "%.0f", held))s")))
+            caption: powerCaption(p, held: held))
+    }
+
+    /// Only claim metering is unavailable when there is genuinely no number.
+    private func powerCaption(_ p: PowerSample?, held: Double) -> String? {
+        guard let p else { return nil }
+        if p.watts.value == nil { return p.watts.confidence.reason }
+        if let m = hub.marginalWatts { return String(format: "+%.1f W vs idle", m) }
+        return "held \(String(format: "%.0f", held))s" + (p.onAC ? " · on AC" : "")
     }
 
     private var thermalTile: some View {

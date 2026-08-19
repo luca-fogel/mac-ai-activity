@@ -82,7 +82,12 @@ final class SourceTracker {
         guard mean > 0 else { return nil }
         // Convert interval sigma to an Hz-space spread.
         let sd = varr.squareRoot()
-        return abs(1 / max(mean - sd, 1e-6) - 1 / (mean + sd)) / 2
+        // Guard the reciprocal: when sd approaches mean, 1/(mean-sd) explodes
+        // and produced a nonsense "+/-499999.8 Hz" on screen.
+        guard sd < mean * 0.9, mean > 1e-3 else { return nil }
+        let hi = 1 / (mean - sd), lo = 1 / (mean + sd)
+        let j = (hi - lo) / 2
+        return j.isFinite && j < 1000 ? j : nil
     }
 
     func latencyP50(_ s: SourceKind, _ e: EngineID?) -> Double? {

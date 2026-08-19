@@ -12,16 +12,20 @@ struct GenerationTimelineView: View {
     @State private var windowSeconds: Double = 60
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: T.gutter) {
-                header
-                GeometryReader { geo in
-                    let w = max(120, geo.size.width - 96)
-                    lanes(width: w)
+        // The width probe MUST be outside the ScrollView. A GeometryReader
+        // inside a ScrollView consumes the offered space and pins its child to
+        // a fixed height, so everything below the fold got clipped and the
+        // view would not scroll at all.
+        GeometryReader { geo in
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: T.gutter) {
+                    header
+                    lanes(width: max(120, geo.size.width - 2 * T.padSection - 96))
                 }
-                .frame(minHeight: 460)
+                .padding(T.padSection)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(T.padSection)
+            .scrollIndicators(.automatic)
         }
     }
 

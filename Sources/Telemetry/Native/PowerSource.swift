@@ -61,12 +61,18 @@ public final class PowerSource: @unchecked Sendable {
         }
         let onAC    = (dict["ExternalConnected"] as? Bool) ?? false
 
-        // PowerTelemetryData.SystemLoad is whole-system draw in mW and is the
-        // RIGHT quantity: it is the load, not the battery current, so unlike
-        // V x I it remains valid on AC. Verified against V x I on battery:
-        // 12.581 W vs 12.57 W.
+        // PowerTelemetryData.SystemLoad is a SIGNED net power figure in mW,
+        // published as unsigned. On battery it equals system draw (verified
+        // against V x I: 12.581 W vs 12.57 W). While CHARGING it goes negative
+        // (observed -25.65 W) because it becomes net flow into the battery, NOT
+        // system load. So it is only usable when positive and plausible --
+        // treating it as draw on AC was wrong and produced a 1.8e16 W reading.
         let telem = dict["PowerTelemetryData"] as? [String: Any]
-        let systemLoadmW = (telem?["SystemLoad"] as? NSNumber)?.doubleValue
+        let systemLoadmW = (telem?["SystemLoad"] as? NSNumber).map { n -> Double in
+            let u = n.uint64Value
+            return u > (UInt64.max / 2) ? -Double(UInt64.max - u + 1) : Double(u)
+        }
+        let isCharging = (dict["IsCharging"] as? Bool) ?? false
         let accEnergy = (telem?["AccumulatedSystemEnergyConsumed"] as? NSNumber)?.uint64Value
         let cur     = (dict["CurrentCapacity"] as? NSNumber)?.doubleValue
         let max     = (dict["MaxCapacity"] as? NSNumber)?.doubleValue
@@ -78,9 +84,11 @@ public final class PowerSource: @unchecked Sendable {
 
         let watts: Estimate<Double>
         var source: String?
-        if let mw = systemLoadmW, mw > 0 {
+        if let mw = systemLoadmW, mw > 0, mw < 200_000 {
             watts = .high(mw / 1000)
             source = "PowerTelemetryData.SystemLoad"
+        } else if isCharging {
+            watts = .unavailable("charging — SystemLoad reports net battery flow, not system draw")
         } else if !onAC, let v = mV, let a = mA, a < 0 {
             watts = .high(v * -a / 1_000_000)
             source = "Voltage x InstantAmperage"

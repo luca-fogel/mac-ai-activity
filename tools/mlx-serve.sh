@@ -11,6 +11,16 @@ PORT="${2:-8131}"
 LOG="$HOME/.local/state/mlx-lm/server.log"
 mkdir -p "$(dirname "$LOG")"
 
+# Fail fast BEFORE loading the model. mlx-lm binds its port only after the
+# weights are in memory, so a port clash costs you a full 15 GB load and then
+# dies with EADDRINUSE -- which is exactly what happened the first time.
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "ERROR: port $PORT is already in use by:" >&2
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | tail -n +2 | awk '{print "  " $1, "pid", $2}' >&2
+  echo "Stop it first, or pass a different port: mlx-serve.sh <model> <port>" >&2
+  exit 1
+fi
+
 # 8080 is LocalAI here, so mlx-lm's default would collide.
 echo "model: $MODEL"
 echo "port:  $PORT"

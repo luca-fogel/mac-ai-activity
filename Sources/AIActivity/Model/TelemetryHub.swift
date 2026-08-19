@@ -29,7 +29,10 @@ final class TelemetryHub {
     /// reads anything through it is invalidated exactly once per redraw.
     struct Snapshot {
         var system: SystemSample?
-        var inference: InferenceSample?
+        /// Per engine. A single slot here meant whichever engine polled last
+        /// overwrote the other, so an alternating GGUF/MLX workload showed
+        /// whichever happened to report most recently.
+        var inference: [EngineID: InferenceSample] = [:]
         var power: PowerSample?
         var roster: [RuntimeInfo] = []
         var revision: Int = 0
@@ -42,7 +45,11 @@ final class TelemetryHub {
     // snapshot underneath.
     var roster: [RuntimeInfo] { snapshot.roster }
     var latestSystem: SystemSample? { snapshot.system }
-    var latestInference: InferenceSample? { snapshot.inference }
+    /// Most recent sample from any engine, newest first.
+    var latestInference: InferenceSample? {
+        snapshot.inference.values.max { $0.t < $1.t }
+    }
+    var inferenceByEngine: [EngineID: InferenceSample] { snapshot.inference }
     var latestPower: PowerSample? { snapshot.power }
     var revision: Int { snapshot.revision }
     var slotPollCount: Int { snapshot.slotPollCount }
@@ -141,7 +148,7 @@ final class TelemetryHub {
             rateSeries.append(t: v.t.s,
                               v.slots.first { $0.state == .processing }?
                                      .decodeTokensPerSecond.value)
-            pending.inference = v
+            pending.inference[v.engine] = v
             pollLog.append((v.t, v.pollDuration * 1000))
             pollLog.removeAll { v.t - $0.t > 60 }
             pending.slotPollCount = pollLog.count
@@ -161,8 +168,19 @@ final class TelemetryHub {
     // MARK: - Derived, computed on demand (not stored, so no invalidation storms)
 
     /// The active slot across all engines, if any.
+    /// The busy slot across ALL engines, not just the one that reported last.
     var activeSlot: SlotSample? {
-        latestInference?.slots.first { $0.state.isBusy }
+        for (_, sample) in snapshot.inference.sorted(by: { $0.value.t > $1.value.t }) {
+            if let s = sample.slots.first(where: { $0.state.isBusy }) { return s }
+        }
+        return nil
+    }
+
+    /// Which engine that busy slot belongs to.
+    var activeEngine: EngineID? {
+        for (engine, sample) in snapshot.inference.sorted(by: { $0.value.t > $1.value.t })
+        where sample.slots.contains(where: { $0.state.isBusy }) { return engine }
+        return nil
     }
 
     var isGenerating: Bool { activeSlot != nil || busyOpaqueRuntime != nil }
@@ -176,9 +194,14 @@ final class TelemetryHub {
     /// with an HTTP API. Showing llama.cpp's model name while MLX is generating
     /// was the app reporting a stale identity as if it were live.
     var workingRuntime: RuntimeInfo? {
-        roster.first { $0.busy && !$0.exposesTokenTelemetry }
-            ?? (activeSlot != nil ? roster.first { $0.exposesTokenTelemetry && $0.residentBytes > 0 } : nil)
-            ?? roster.first { $0.residentBytes > 1_000_000_000 }
+        // 1. The engine we can SEE generating wins, whichever it is.
+        if let e = activeEngine, let r = roster.first(where: { $0.engine == e }) { return r }
+        // 2. A runtime that reports busy but exposes no token detail (MLX in Bionic).
+        if let r = roster.first(where: { $0.busy }) { return r }
+        // 3. Only when nothing is working: the largest resident model.
+        //    This was the ONLY branch that used to fire, which is why the header
+        //    showed llama.cpp's model the entire time mlx-lm was generating.
+        return roster.max { ($0.residentBytes, $0.engine.rawValue) < ($1.residentBytes, $1.engine.rawValue) }
     }
 
     /// The GPU is clearly working, but nothing we can instrument accounts for

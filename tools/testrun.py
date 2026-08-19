@@ -101,7 +101,8 @@ with urllib.request.urlopen(req, timeout=900) as r:
         try: d = json.loads(chunk)
         except Exception: continue
         delta = (d.get("choices") or [{}])[0].get("delta", {})
-        piece = delta.get("content") or delta.get("reasoning_content") or ""
+        piece = (delta.get("content") or delta.get("reasoning_content")
+                 or delta.get("reasoning") or "")
         if not piece: continue
         now = time.perf_counter()
         if ttft is None:

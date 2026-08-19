@@ -21,6 +21,10 @@ public actor LiveTelemetryFeed: TelemetryFeed {
 
     private var machines: [EngineID: SlotStateMachine] = [:]
     private var mlxTailer: MLXLogTailer?
+    /// Whether each engine is doing work right now. Without this the roster
+    /// reported every engine as idle, so the UI fell back to "largest resident"
+    /// and showed llama.cpp's model while mlx-lm was the one generating.
+    private var busyByEngine: [EngineID: Bool] = [:]
     private var clients: [EngineID: LlamaSlotsClient] = [:]
     private var descriptors: [EngineID: RuntimeDescriptor] = [:]
     private var detector = ActivityDetector()
@@ -194,7 +198,7 @@ public actor LiveTelemetryFeed: TelemetryFeed {
         return RuntimeInfo(
             engine: d.engine,
             backend: d.engine == .bionic ? "llama.cpp" : (d.engine == .mlxlm ? "mlx-lm" : nil),
-            busy: false,
+            busy: busyByEngine[d.engine] ?? false,
             // mlx-lm's telemetry comes from its log; if the log is not where we
             // expect it, say so rather than reporting silence as idle.
             exposesTokenTelemetry: d.engine != .mlxlm || mlxTailer != nil,
@@ -249,6 +253,7 @@ public actor LiveTelemetryFeed: TelemetryFeed {
                 slots.append(s)
             }
             machines[engine] = machine
+            busyByEngine[engine] = slots.contains { $0.state.isBusy }
             if advanced { confirmedAdvance = true }
 
             cont.yield(.inference(InferenceSample(
@@ -276,8 +281,11 @@ public actor LiveTelemetryFeed: TelemetryFeed {
         guard let tailer = mlxTailer, let d = descriptors[.mlxlm] else { return }
         let t = Instant.now()
         let st = tailer.poll(now: t)
+        // 4 s, not 2: token totals only land in the log at the END of a
+        // request, so a shorter window declared mlx-lm idle while the GPU was
+        // still visibly working and the UI called it "unattributed activity".
         let busy = st.prefilling
-            || (st.lastActivityAt.map { t - $0 < 2 } ?? false)
+            || (st.lastActivityAt.map { t - $0 < 4 } ?? false)
 
         let raw = LlamaSlotsClient.RawSlot(
             id: 0, isProcessing: busy, nCtx: d.facts.fittedContext ?? 0,
@@ -294,6 +302,7 @@ public actor LiveTelemetryFeed: TelemetryFeed {
         var machine = machines[.mlxlm] ?? SlotStateMachine()
         let slot = machine.update(raw, at: t, fittedContext: d.facts.fittedContext)
         machines[.mlxlm] = machine
+        busyByEngine[.mlxlm] = slot.state.isBusy
 
         cont.yield(.inference(InferenceSample(
             requestedAt: t, t: t, engine: .mlxlm,

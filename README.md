@@ -166,6 +166,36 @@ every field they provide is now collected natively in microseconds. `llmctl`'s
 file-backed page cache from "used" is hard-won and non-obvious, because a
 20–46 GB mmap'd GGUF in the cache would otherwise read as memory pressure.
 
+## GGUF vs MLX, benchmarked
+
+`tools/ab-engines.py` runs both engines **interleaved** (not blocked), because
+run-to-run drift here was previously measured at -22% across six runs — five
+times the effect under test.
+
+Two blocks, 3 trials each, 220 tokens, identical prompt, Qwen3.8-27B:
+
+| | mean | sd | TTFT |
+|---|---|---|---|
+| llama.cpp GGUF Q5_K_M | 7.56 tok/s | 0.33 | 4.77 s (sd 1.91) |
+| mlx-lm MLX 4-bit | **12.21 tok/s** | 1.33 | 9.21 s (sd 7.26) |
+
+**MLX is +61.4% on throughput**, with complete separation (slowest MLX run beat
+the fastest GGUF run) and an exact permutation test at **p = 0.0022**.
+
+Three things keep that from being the whole story:
+
+- **Precision differs.** 4-bit group-64 vs 5-bit K-quant. MLX has an advantage
+  going in, though 20% fewer bits does not obviously buy 61% more throughput.
+- **GGUF was handicapped in MLX's favour too**: it ran with speculative decoding
+  (`--spec-type draft-mtp`) and flash attention, and still lost.
+- **TTFT is much worse and 3.8x more variable on MLX** — it swung from 0.28 s on
+  a cache hit to 15.89 s on a miss. If you care about latency to first token
+  rather than sustained throughput, that reverses the recommendation.
+
+Energy per token could not be measured for this run: the machine was plugged in
+and charging, and `SystemLoad` reports net battery flow (negative) rather than
+system draw while charging. Unplug, or wait until the battery is full, to get it.
+
 ## The MLX blind spot
 
 Bionic can host **two backends at once**: llama.cpp (GGUF) and MLX (safetensors).
