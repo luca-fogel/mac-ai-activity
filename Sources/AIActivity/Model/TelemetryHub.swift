@@ -68,6 +68,11 @@ final class TelemetryHub {
 
     /// Rolling receipts for the observer-effect readout.
     @ObservationIgnored private var pollLog: [(t: Instant, ms: Double)] = []
+    /// When each engine was last observed doing work. Without this, an idle
+    /// machine with two models resident always showed the LARGEST one, so the
+    /// header sat on llama.cpp's 21 GB model forever even when every recent
+    /// generation had run on mlx-lm.
+    @ObservationIgnored private(set) var lastBusyAt: [EngineID: Instant] = [:]
 
     var now: Instant { Instant.now() }
 
@@ -142,6 +147,7 @@ final class TelemetryHub {
             tracker.noteGPU(v.gpuDevice, at: v.t)
             refreshEpisodes(at: v.t)
         case .inference(let v):
+            if v.slots.contains(where: { $0.state.isBusy }) { lastBusyAt[v.engine] = v.t }
             if let busy = v.slots.first(where: { $0.state == .processing }) {
                 tracker.noteTokens(busy.nDecoded, prefillEnded: v.t)
             }
@@ -198,10 +204,19 @@ final class TelemetryHub {
         if let e = activeEngine, let r = roster.first(where: { $0.engine == e }) { return r }
         // 2. A runtime that reports busy but exposes no token detail (MLX in Bionic).
         if let r = roster.first(where: { $0.busy }) { return r }
-        // 3. Only when nothing is working: the largest resident model.
-        //    This was the ONLY branch that used to fire, which is why the header
-        //    showed llama.cpp's model the entire time mlx-lm was generating.
+        // 3. Idle: the engine that ran MOST RECENTLY. "Biggest resident" is not
+        //    the same question, and answering it here pinned the header to
+        //    llama.cpp's 21 GB model no matter what you had actually been using.
+        if let e = lastBusyAt.max(by: { $0.value < $1.value })?.key,
+           let r = roster.first(where: { $0.engine == e }) { return r }
+        // 4. Nothing has run since launch: fall back to the largest resident.
         return roster.max { ($0.residentBytes, $0.engine.rawValue) < ($1.residentBytes, $1.engine.rawValue) }
+    }
+
+    /// Engines holding a model right now. Surfaced because showing ONE model in
+    /// the header is misleading when several are loaded and competing for RAM.
+    var residentRuntimes: [RuntimeInfo] {
+        roster.filter { $0.residentBytes > 1_000_000_000 }
     }
 
     /// The GPU is clearly working, but nothing we can instrument accounts for

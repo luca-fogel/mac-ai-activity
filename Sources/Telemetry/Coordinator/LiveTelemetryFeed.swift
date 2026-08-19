@@ -211,7 +211,10 @@ public actor LiveTelemetryFeed: TelemetryFeed {
             flashAttention: d.facts.flashAttention,
             loadMode: d.facts.loadMode,
             reachable: true,
-            residentBytes: ru?.ri_wired_size ?? 0)
+            // Footprint, not wired: llama.cpp mlocks its weights (wired 18.5 GB)
+            // but mlx-lm does not (wired 0), so keying residency on wired made a
+            // 14 GB resident model look like it was holding nothing.
+            residentBytes: ru?.ri_phys_footprint ?? 0)
     }
 
     // MARK: - Stream B: /slots, <= 1 Hz, single in-flight

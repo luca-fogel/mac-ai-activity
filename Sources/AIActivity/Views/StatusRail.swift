@@ -57,8 +57,15 @@ struct StatusRail: View {
                     if let b = bionic?.backend { Chip(text: b, tint: T.engineBionic) }
                     if let q = bionic?.quantization { Chip(text: q) }
                     if let s = bionic?.speculativeType { Chip(text: "spec \(s)") }
-                    Text(hub.isGenerating ? "generating" : "idle")
+                    Text(stateWord)
                         .font(.system(size: 10)).foregroundStyle(T.inkMuted)
+                    if hub.residentRuntimes.count > 1 {
+                        Text("· \(hub.residentRuntimes.count) models resident")
+                            .font(.system(size: 10)).foregroundStyle(T.warning)
+                            .help(hub.residentRuntimes
+                                    .map { "\($0.backend ?? $0.engine.displayName): \(Fmt.bytes($0.residentBytes))" }
+                                    .joined(separator: "\n"))
+                    }
                 }
             }
         }
@@ -69,6 +76,12 @@ struct StatusRail: View {
     }
 
     @State private var cachedFacts: String = ""
+
+    /// "idle" alone implied this was the only model. It is not.
+    private var stateWord: String {
+        if hub.isGenerating { return "generating" }
+        return hub.lastBusyAt.isEmpty ? "idle" : "idle · last active"
+    }
 
     private var staticFacts: String {
         guard let b = bionic else { return "No model resident." }
@@ -117,7 +130,7 @@ struct StatusRail: View {
         guard let p else { return nil }
         if p.watts.value == nil { return p.watts.confidence.reason }
         if let m = hub.marginalWatts { return String(format: "+%.1f W vs idle", m) }
-        return "held \(String(format: "%.0f", held))s" + (p.onAC ? " · on AC" : "")
+        return "held \(String(format: "%.0f", max(0, held)))s" + (p.onAC ? " · on AC" : "")
     }
 
     private var thermalTile: some View {

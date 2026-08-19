@@ -159,7 +159,7 @@ struct GenerationTimelineView: View {
         guard let p = hub.latestPower else { return Fmt.dash }
         guard let w = p.watts.value else { return p.watts.confidence.reason ?? Fmt.dash }
         let age = p.t - p.lastRefreshedAt
-        return String(format: "%.1f W · held %.0fs", w, age)
+        return String(format: "%.1f W · held %.0fs", w, max(0, age))
     }
 
     private var rugRows: [SampleRug.Row] {
