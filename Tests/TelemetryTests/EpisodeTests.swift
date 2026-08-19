@@ -79,3 +79,73 @@ final class EpisodeTests: XCTestCase {
         XCTAssertEqual(t.completed.first!.energyJoules, 0)
     }
 }
+
+/// mlx-lm has no /slots and no /metrics; its log is the telemetry channel.
+final class MLXLogTailerTests: XCTestCase {
+
+    func write(_ lines: [String]) -> String {
+        let p = NSTemporaryDirectory() + "mlxtest-\(UUID().uuidString).log"
+        FileManager.default.createFile(atPath: p, contents: Data())
+        try? lines.joined(separator: "\n").appending("\n").write(toFile: p, atomically: false, encoding: .utf8)
+        return p
+    }
+
+    func testParsesPrefillProgress() {
+        let p = write([])
+        let t = MLXLogTailer(path: p)
+        try? "2026-08-19 16:31:11,359 - INFO - Prompt processing progress: 34/35\n"
+            .write(toFile: p, atomically: false, encoding: .utf8)
+        let s = t.poll(now: Instant(1))
+        XCTAssertEqual(s.promptProcessed, 34)
+        XCTAssertEqual(s.promptTotal, 35)
+        XCTAssertTrue(s.prefilling, "34 of 35 means prefill is still running")
+    }
+
+    func testPrefillCompletesWhenProgressReachesTotal() {
+        let p = write([])
+        let t = MLXLogTailer(path: p)
+        try? "INFO - Prompt processing progress: 35/35\n"
+            .write(toFile: p, atomically: false, encoding: .utf8)
+        XCTAssertFalse(t.poll(now: Instant(1)).prefilling)
+    }
+
+    func testParsesUsageFromTheLoggedResponseBody() {
+        let p = write([])
+        let t = MLXLogTailer(path: p)
+        try? "\t\t\"completion_tokens\": 80,\n\t\t\t\"cached_tokens\": 12\n"
+            .write(toFile: p, atomically: false, encoding: .utf8)
+        let s = t.poll(now: Instant(1))
+        XCTAssertEqual(s.completionTokens, 80)
+        XCTAssertEqual(s.cachedTokens, 12)
+        XCTAssertEqual(s.requestsSeen, 1)
+    }
+
+    func testParsesPromptCacheLine() {
+        let p = write([])
+        let t = MLXLogTailer(path: p)
+        try? "INFO - Prompt Cache: 3 sequences, 1.25 GB\n"
+            .write(toFile: p, atomically: false, encoding: .utf8)
+        let s = t.poll(now: Instant(1))
+        XCTAssertEqual(s.cacheSequences, 3)
+        XCTAssertEqual(s.cacheGB ?? 0, 1.25, accuracy: 0.001)
+    }
+
+    // A truncated final line must not be parsed until it is complete.
+    func testHoldsPartialLines() {
+        let p = write([])
+        let t = MLXLogTailer(path: p)
+        try? "INFO - Prompt processing progr".write(toFile: p, atomically: false, encoding: .utf8)
+        XCTAssertNil(t.poll(now: Instant(1)).promptProcessed)
+        try? "INFO - Prompt processing progress: 7/9\n".write(toFile: p, atomically: false, encoding: .utf8)
+        // The file was rewritten smaller then larger; the tailer must recover.
+        _ = t.poll(now: Instant(2))
+    }
+
+    func testMissingLogIsReportedNotFabricated() {
+        let t = MLXLogTailer(path: "/nonexistent/mlx.log")
+        XCTAssertFalse(t.exists)
+        let s = t.poll(now: Instant(1))
+        XCTAssertNil(s.completionTokens)
+        XCTAssertNil(s.promptTotal)
+    }
+}

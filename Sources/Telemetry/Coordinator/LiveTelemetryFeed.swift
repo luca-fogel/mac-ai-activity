@@ -20,6 +20,7 @@ public actor LiveTelemetryFeed: TelemetryFeed {
     private let registry = EndpointRegistry()
 
     private var machines: [EngineID: SlotStateMachine] = [:]
+    private var mlxTailer: MLXLogTailer?
     private var clients: [EngineID: LlamaSlotsClient] = [:]
     private var descriptors: [EngineID: RuntimeDescriptor] = [:]
     private var detector = ActivityDetector()
@@ -148,6 +149,10 @@ public actor LiveTelemetryFeed: TelemetryFeed {
             }
             descriptors = Dictionary(uniqueKeysWithValues: runtimes.map { ($0.engine, $0) })
 
+            if runtimes.contains(where: { $0.engine == .mlxlm }), mlxTailer == nil {
+                let t = MLXLogTailer()
+                if t.exists { mlxTailer = t }
+            }
             for d in runtimes where clients[d.engine] == nil && d.engine == .bionic {
                 clients[d.engine] = LlamaSlotsClient(
                     host: d.host, port: d.port, key: d.key, timeout: 2.0)
@@ -160,7 +165,7 @@ public actor LiveTelemetryFeed: TelemetryFeed {
             var entries = runtimes.map(rosterEntry)
             for m in LMStudioProbe.snapshot() where m.isMLX {
                 entries.append(RuntimeInfo(
-                    engine: .bionic, backend: "MLX", busy: m.isGenerating,
+                    engine: .bionic, backend: "MLX (embedded)", busy: m.isGenerating,
                     exposesTokenTelemetry: false,          // no /slots equivalent
                     endpoint: "Bionic IPC (no HTTP port)",
                     modelName: m.identifier,
@@ -187,7 +192,12 @@ public actor LiveTelemetryFeed: TelemetryFeed {
     private func rosterEntry(_ d: RuntimeDescriptor) -> RuntimeInfo {
         let ru = ProcSampler.rusage(d.generation.pid)
         return RuntimeInfo(
-            engine: d.engine, backend: d.engine == .bionic ? "llama.cpp" : nil,
+            engine: d.engine,
+            backend: d.engine == .bionic ? "llama.cpp" : (d.engine == .mlxlm ? "mlx-lm" : nil),
+            busy: false,
+            // mlx-lm's telemetry comes from its log; if the log is not where we
+            // expect it, say so rather than reporting silence as idle.
+            exposesTokenTelemetry: d.engine != .mlxlm || mlxTailer != nil,
             generation: d.generation,
             endpoint: "\(d.host):\(d.port)",
             modelName: d.facts.modelName, quantization: d.facts.quantization,
@@ -217,6 +227,7 @@ public actor LiveTelemetryFeed: TelemetryFeed {
                 guard let d = descriptors[engine] else { continue }
                 await pollSlots(engine: engine, client: client, descriptor: d)
             }
+            pollMLX()
             try? await Task.sleep(nanoseconds: UInt64(interval * 1e9))
         }
     }
@@ -254,6 +265,40 @@ public actor LiveTelemetryFeed: TelemetryFeed {
             emitHealth(.slots, engine: engine, t: t,
                        outcome: Self.classify(error), latency: t - issued)
         }
+    }
+
+    /// mlx-lm has no /slots and no /metrics, so its log is the telemetry
+    /// channel. Prefill progress arrives live; token totals only at the end of
+    /// a request, so decode rate is derived per episode rather than per sample.
+    /// The result is fed through the SAME state machine as llama.cpp, so the
+    /// stale-counter and boundary protections apply identically.
+    private func pollMLX() {
+        guard let tailer = mlxTailer, let d = descriptors[.mlxlm] else { return }
+        let t = Instant.now()
+        let st = tailer.poll(now: t)
+        let busy = st.prefilling
+            || (st.lastActivityAt.map { t - $0 < 2 } ?? false)
+
+        let raw = LlamaSlotsClient.RawSlot(
+            id: 0, isProcessing: busy, nCtx: d.facts.fittedContext ?? 0,
+            speculative: d.facts.speculativeType != nil,
+            idTask: st.requestsSeen,
+            nPromptTokens: st.promptTotal,
+            nPromptTokensProcessed: st.promptProcessed,
+            nPromptTokensCache: st.cachedTokens,
+            nDecoded: st.completionTokens,
+            nRemain: nil, hasNextToken: busy, sampler: nil,
+            specTypes: d.facts.speculativeType,
+            hasCounters: st.promptTotal != nil || st.completionTokens != nil)
+
+        var machine = machines[.mlxlm] ?? SlotStateMachine()
+        let slot = machine.update(raw, at: t, fittedContext: d.facts.fittedContext)
+        machines[.mlxlm] = machine
+
+        cont.yield(.inference(InferenceSample(
+            requestedAt: t, t: t, engine: .mlxlm,
+            generation: d.generation, slots: [slot])))
+        emitHealth(.slots, engine: .mlxlm, t: t, outcome: .ok, latency: 0)
     }
 
     public func selfCost() -> SelfCost {

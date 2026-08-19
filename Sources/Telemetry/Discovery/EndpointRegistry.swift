@@ -33,6 +33,17 @@ public actor EndpointRegistry {
         ("ollama", .ollama),
     ]
 
+    /// Servers that run inside an interpreter have a useless `comm` -- mlx-lm
+    /// reports "Python". Reading argv for all ~360 same-uid processes would
+    /// cost ~470 ms, so argv is consulted ONLY for interpreters, and only for
+    /// pids we have not already classified.
+    private static let interpreters = ["Python", "python", "node", "uv", "ruby"]
+    private static let argvPatterns: [(needle: String, engine: EngineID)] = [
+        ("mlx_lm.server", .mlxlm),
+        ("mlx_lm/server", .mlxlm),
+        ("vllm.entrypoints", .mlxlm),
+    ]
+
     public init() {}
 
     /// Returns the current descriptors and the set of engines whose generation
@@ -43,8 +54,20 @@ public actor EndpointRegistry {
         var changed: Set<EngineID> = []
 
         for b in ProcSampler.scan() {
-            guard let engine = Self.known.first(where: { b.comm.hasPrefix(String($0.prefix.prefix(15))) })?.engine
-            else { continue }
+            var engine = Self.known.first { b.comm.hasPrefix(String($0.prefix.prefix(15))) }?.engine
+            var interpreterArgv: ProcArgs.Info?
+            if engine == nil, Self.interpreters.contains(where: { b.comm.contains($0) }) {
+                // Cheap enough: only a handful of interpreters are running, and
+                // the result is cached per (pid, startTime) generation.
+                if let info = ProcArgs.read(b.pid),
+                   let hit = Self.argvPatterns.first(where: { pat in
+                       info.argv.contains { $0.contains(pat.needle) }
+                   }) {
+                    engine = hit.engine
+                    interpreterArgv = info
+                }
+            }
+            guard let engine else { continue }
             // Prefer the process that is actually listening.
             let ports = ProcSockets.listeningPorts(b.pid)
             guard !ports.isEmpty else { continue }
@@ -61,7 +84,7 @@ public actor EndpointRegistry {
             }
 
             // New generation: enrich. This is the only place argv is read.
-            let info = ProcArgs.read(b.pid)
+            let info = interpreterArgv ?? ProcArgs.read(b.pid)
             let facts = info.map { ArgvFacts.parse($0.argv) } ?? ArgvFacts()
             let key = info.flatMap { ArgvFacts.apiKey($0.argv) }.map(APIKey.init)
             let argvPort = facts.port

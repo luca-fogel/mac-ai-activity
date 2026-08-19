@@ -17,14 +17,20 @@ public struct ArgvFacts: Sendable, Equatable {
     public var threads: Int?
     public var host: String?
     public var port: UInt16?
+    public var draftTokens: Int?
+    public var promptCacheSize: Int?
 
     public var modelName: String? {
         modelPath.map { ($0 as NSString).lastPathComponent }
     }
 
-    /// Quantization inferred from the GGUF filename, e.g. "Q5_K_M".
+    /// Quantization inferred from the model name, e.g. "Q5_K_M" or "4bit".
     public var quantization: String? {
         guard let n = modelName else { return nil }
+        // mlx-lm names carry it as a suffix: ...-Instruct-4bit
+        if let m = n.range(of: #"(?<![A-Za-z0-9])\d+bit"#, options: [.regularExpression, .caseInsensitive]) {
+            return String(n[m]).lowercased()
+        }
         let stem = (n as NSString).deletingPathExtension
         for part in stem.split(separator: "-").reversed() {
             let p = String(part)
@@ -54,6 +60,11 @@ public struct ArgvFacts: Sendable, Equatable {
             case "--fit-ctx":            f.fittedContext = value(i).flatMap(Int.init)
             case "--parallel", "-np":    f.parallelSlots = value(i).flatMap(Int.init)
             case "--spec-type":          f.speculativeType = value(i)
+            // mlx-lm spells speculative decoding differently.
+            case "--draft-model":        f.speculativeType = value(i).map { ($0 as NSString).lastPathComponent }
+            case "--num-draft-tokens":   f.draftTokens = value(i).flatMap(Int.init)
+            case "--decode-concurrency": f.parallelSlots = value(i).flatMap(Int.init)
+            case "--prompt-cache-size":  f.promptCacheSize = value(i).flatMap(Int.init)
             case "--load-mode":          f.loadMode = value(i)
             case "--threads", "-t":      f.threads = value(i).flatMap(Int.init)
             case "--host":               f.host = value(i)

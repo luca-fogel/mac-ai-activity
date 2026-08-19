@@ -109,43 +109,30 @@ if args.contains("--power") {
 }
 
 if args.contains("--discover") {
-    let known: [(String, EngineID)] = [
-        ("llama-server", .bionic), ("local-ai", .localai),
-        ("ollama", .ollama), ("llama-cpp", .localai),
-    ]
-    let t0 = DispatchTime.now().uptimeNanoseconds
-    let briefs = ProcSampler.scan()
-    let scanMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
-    print(String(format: "scanned %d same-uid pids in %.2f ms", briefs.count, scanMs))
-    for b in briefs {
-        guard let (_, engine) = known.first(where: { b.comm.hasPrefix(String($0.0.prefix(15))) })
-        else { continue }
-        print("\n\u{2500}\u{2500} pid \(b.pid)  comm=\(b.comm)  -> \(engine.displayName)")
-        let started = ProcSampler.startedAt(b.pid)
-        print("   startedAt   \(started.map(String.init) ?? "—")")
-        let ports = ProcSockets.listeningPorts(b.pid)
-        print("   listening   \(ports.isEmpty ? "—" : ports.map(String.init).joined(separator: ", "))")
-        if let info = ProcArgs.read(b.pid) {
-            let f = ArgvFacts.parse(info.argv)
-            print("   argv        \(info.argv.count) entries")
-            print("   model       \(f.modelName ?? "—")   quant \(f.quantization ?? "—")")
-            print("   ctx         requested \(f.requestedContext.map(String.init) ?? "—")  fitted \(f.fittedContext.map(String.init) ?? "—")")
-            print("   port(argv)  \(f.port.map(String.init) ?? "—")   host \(f.host ?? "—")")
-            print("   parallel    \(f.parallelSlots.map(String.init) ?? "—")   spec \(f.speculativeType ?? "—")   flashAttn \(f.flashAttention.map(String.init) ?? "—")")
-            print("   apiKey      \(ArgvFacts.apiKey(info.argv).map { _ in APIKey("x").description } ?? "—") (present: \(ArgvFacts.apiKey(info.argv) != nil))")
-            if let argvPort = f.port, !ports.isEmpty, !ports.contains(argvPort) {
-                print("   \u{26A0} argv port \(argvPort) not in listening set — socket wins")
+    // Uses the REAL EndpointRegistry, not a parallel list, so this verifies the
+    // code path the app actually runs.
+    let sem = DispatchSemaphore(value: 0)
+    Task.detached {
+        let reg = EndpointRegistry()
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        let (runtimes, _) = await reg.refresh()
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+        print(String(format: "discovery took %.2f ms; found %d runtime(s)\n", ms, runtimes.count))
+        for d in runtimes {
+            print("\u{2500}\u{2500} \(d.engine.displayName)  pid \(d.generation.pid)  comm=\(d.command)")
+            print("   endpoint    \(d.host):\(d.port)\(d.portDisagreement ? "  (argv disagreed; socket wins)" : "")")
+            print("   model       \(d.facts.modelName ?? "—")   quant \(d.facts.quantization ?? "—")")
+            print("   ctx         requested \(d.facts.requestedContext.map(String.init) ?? "—")  fitted \(d.facts.fittedContext.map(String.init) ?? "—")")
+            print("   parallel    \(d.facts.parallelSlots.map(String.init) ?? "—")   spec \(d.facts.speculativeType ?? "—")   apiKey \(d.key != nil)")
+            if let ru = ProcSampler.rusage(d.generation.pid) {
+                print(String(format: "   memory      footprint %.2f GiB   wired %.2f GiB",
+                             Double(ru.ri_phys_footprint)/1073741824, Double(ru.ri_wired_size)/1073741824))
             }
-        } else { print("   argv        <unreadable>") }
-        if let ti = ProcSampler.taskInfo(b.pid) {
-            print(String(format: "   rss      %7.2f GiB", Double(ti.pti_resident_size)/1073741824))
+            print("")
         }
-        if let ru = ProcSampler.rusage(b.pid) {
-            print(String(format: "   footprint %6.2f GiB   wired %6.2f GiB   energy %.1f J   diskRead %.2f GiB",
-                Double(ru.ri_phys_footprint)/1073741824, Double(ru.ri_wired_size)/1073741824,
-                Double(ru.ri_energy_nj)/1e9, Double(ru.ri_diskio_bytesread)/1073741824))
-        }
+        sem.signal()
     }
+    _ = sem.wait(timeout: .now() + 20)
     exit(0)
 }
 

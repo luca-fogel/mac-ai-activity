@@ -26,12 +26,15 @@ public enum EngineID: String, Sendable, Hashable, CaseIterable {
     case bionic     // LM Studio rebranded; JIT-spawns a bundled llama-server
     case localai
     case ollama
+    case mlxlm      // Apple's mlx-lm server: a real HTTP endpoint, unlike
+                    // Bionic's embedded MLX runtime which has no port at all
 
     public var displayName: String {
         switch self {
         case .bionic:  return "Bionic"
         case .localai: return "LocalAI"
         case .ollama:  return "Ollama"
+        case .mlxlm:   return "mlx-lm"
         }
     }
 }

@@ -86,11 +86,16 @@ extension Color {
 }
 
 extension EngineID {
+    /// Only three categorical hues survived CVD validation against this
+    /// surface, so mlx-lm shares yellow with Ollama. They never compete for it
+    /// in practice: hue is earned by residency, and Ollama on this machine is
+    /// embeddings-only and holds nothing, so it always renders muted.
     var hue: Color {
         switch self {
         case .bionic:  return T.engineBionic
         case .localai: return T.engineLocalAI
         case .ollama:  return T.engineOllama
+        case .mlxlm:   return T.engineOllama
         }
     }
 }
