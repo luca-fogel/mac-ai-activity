@@ -127,14 +127,18 @@ struct SampleRug: View {
                     Text(row.label).font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(T.inkMuted).frame(width: 30, alignment: .leading)
                     Canvas(opaque: false, rendersAsynchronously: false) { ctx, size in
-                        if case .dark(let reason) = row.liveness {
+                        var note: String? = nil
+                        if case .dark(let r) = row.liveness { note = r }
+                        if case .absent(let r) = row.liveness { note = r }
+                        if let reason = note {
                             var p = Path()
                             p.move(to: CGPoint(x: 0, y: size.height / 2))
                             p.addLine(to: CGPoint(x: size.width, y: size.height / 2))
-                            ctx.stroke(p, with: .color(T.critical.opacity(0.5)),
+                            let tint = row.liveness.isAbsent ? T.inkDisabled : T.critical
+                            ctx.stroke(p, with: .color(tint.opacity(0.5)),
                                        style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
                             ctx.draw(Text(reason).font(.system(size: 8))
-                                        .foregroundStyle(T.critical),
+                                        .foregroundStyle(tint),
                                      at: CGPoint(x: 4, y: size.height / 2), anchor: .leading)
                             return
                         }

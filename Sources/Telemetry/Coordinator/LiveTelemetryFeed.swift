@@ -25,6 +25,11 @@ public actor LiveTelemetryFeed: TelemetryFeed {
     /// reported every engine as idle, so the UI fell back to "largest resident"
     /// and showed llama.cpp's model while mlx-lm was the one generating.
     private var busyByEngine: [EngineID: Bool] = [:]
+    /// Consecutive failures per engine, for backoff. Without this the app
+    /// polled a stopped server at full rate forever and reported "connection
+    /// refused" -- which reads as a fault when the truth is "you stopped it".
+    private var failures: [EngineID: Int] = [:]
+    private var nextAttemptAt: [EngineID: Instant] = [:]
     private var clients: [EngineID: LlamaSlotsClient] = [:]
     private var descriptors: [EngineID: RuntimeDescriptor] = [:]
     private var detector = ActivityDetector()
@@ -150,7 +155,13 @@ public actor LiveTelemetryFeed: TelemetryFeed {
                 machines[e]?.reset()
                 machines[e] = SlotStateMachine()
                 clients[e] = nil
+                failures[e] = 0
+                nextAttemptAt[e] = nil
+                busyByEngine[e] = false
             }
+            // mlx-lm's telemetry is a log, not a socket, so it needs retiring
+            // explicitly when the server goes away.
+            if !runtimes.contains(where: { $0.engine == .mlxlm }) { mlxTailer = nil }
             descriptors = Dictionary(uniqueKeysWithValues: runtimes.map { ($0.engine, $0) })
 
             if runtimes.contains(where: { $0.engine == .mlxlm }), mlxTailer == nil {
@@ -230,11 +241,15 @@ public actor LiveTelemetryFeed: TelemetryFeed {
                 continue
             }
 
+            let now = Instant.now()
             for (engine, client) in clients {
+                // A stopped server is not an error condition; it is simply
+                // absent, and absent sources are not polled at all.
                 guard let d = descriptors[engine] else { continue }
+                if let next = nextAttemptAt[engine], now < next { continue }
                 await pollSlots(engine: engine, client: client, descriptor: d)
             }
-            pollMLX()
+            if descriptors[.mlxlm] != nil { pollMLX() }
             try? await Task.sleep(nanoseconds: UInt64(interval * 1e9))
         }
     }
@@ -267,9 +282,17 @@ public actor LiveTelemetryFeed: TelemetryFeed {
             slotPollTimes.append((t, ms))
             slotPollTimes.removeAll { t - $0.t > 60 }
 
+            failures[engine] = 0
+            nextAttemptAt[engine] = nil
             emitHealth(.slots, engine: engine, t: t, outcome: .ok, latency: t - issued)
         } catch {
             let t = Instant.now()
+            let n = (failures[engine] ?? 0) + 1
+            failures[engine] = n
+            // 1s, 2s, 4s ... capped at 30s. A server that is down stays down;
+            // there is nothing to learn from asking 60 times a minute.
+            let backoff = min(30.0, pow(2.0, Double(min(n, 5))))
+            nextAttemptAt[engine] = Instant(t.s + backoff)
             emitHealth(.slots, engine: engine, t: t,
                        outcome: Self.classify(error), latency: t - issued)
         }

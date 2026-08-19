@@ -118,6 +118,9 @@ struct LivenessChip: View {
     var body: some View {
         HStack(spacing: 5) {
             switch liveness {
+            case .absent(let what):
+                Circle().strokeBorder(T.inkDisabled, lineWidth: 1).frame(width: 5, height: 5)
+                Text("\(name) \(what)").font(T.mono).foregroundStyle(T.inkDisabled)
             case .live(let hz, let jitter):
                 Circle().fill(T.good).frame(width: 5, height: 5)
                 Text("\(name) \(Fmt.hz(hz))").font(T.mono).foregroundStyle(T.inkSecondary)

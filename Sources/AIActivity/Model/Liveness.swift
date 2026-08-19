@@ -5,6 +5,10 @@ import Telemetry
 /// incommensurable, not merely tinted: a source going dark must never look
 /// like a source reading zero.
 enum Liveness: Equatable {
+    /// No server of this kind is running. Distinct from `dark`: nothing has
+    /// failed, there is simply nothing there. Reporting a stopped server as
+    /// "connection refused" reads as a fault the user should act on.
+    case absent(String)
     case live(hz: Double, jitter: Double)
     /// The value is real but the source has not refreshed yet — battery power
     /// updates only every few seconds. Full ink, but badged with its age.
@@ -13,6 +17,7 @@ enum Liveness: Equatable {
     case dark(reason: String)
 
     var isDark: Bool { if case .dark = self { return true }; return false }
+    var isAbsent: Bool { if case .absent = self { return true }; return false }
 }
 
 /// Tracks measured arrival rates per source. The Hz shown in the UI is

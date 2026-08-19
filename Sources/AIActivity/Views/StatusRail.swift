@@ -159,8 +159,7 @@ struct StatusRail: View {
         return HStack(spacing: 12) {
             LivenessChip(name: "sys",
                          liveness: hub.sources.liveness(.system, nil, now: now, expected: 0.5))
-            LivenessChip(name: "inf",
-                         liveness: hub.sources.liveness(.slots, .bionic, now: now, expected: 1.0))
+            LivenessChip(name: "inf", liveness: hub.inferenceLiveness)
             LivenessChip(name: "pwr", liveness: powerLiveness)
         }
     }

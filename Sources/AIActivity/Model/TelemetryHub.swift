@@ -221,6 +221,18 @@ final class TelemetryHub {
         return roster.max { ($0.residentBytes, $0.engine.rawValue) < ($1.residentBytes, $1.engine.rawValue) }
     }
 
+    /// Health of the inference domain, for whichever engine is actually there.
+    /// Hardcoding this to Bionic meant stopping that server showed a permanent
+    /// red error even when mlx-lm was serving fine.
+    var inferenceLiveness: Liveness {
+        let engines = roster.filter { $0.engine != .ollama && $0.engine != .localai }
+        guard !engines.isEmpty else {
+            return .absent("no inference server running")
+        }
+        let target = workingRuntime?.engine ?? engines[0].engine
+        return sources.liveness(.slots, target, now: now, expected: 1.0)
+    }
+
     /// Engines holding a model right now. Surfaced because showing ONE model in
     /// the header is misleading when several are loaded and competing for RAM.
     var residentRuntimes: [RuntimeInfo] {
