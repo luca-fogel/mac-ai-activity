@@ -148,7 +148,33 @@ final class TelemetryHub {
         latestInference?.slots.first { $0.state.isBusy }
     }
 
-    var isGenerating: Bool { activeSlot != nil }
+    var isGenerating: Bool { activeSlot != nil || busyOpaqueRuntime != nil }
+
+    /// A runtime we can see is working but cannot instrument (MLX).
+    var busyOpaqueRuntime: RuntimeInfo? {
+        roster.first { $0.busy && !$0.exposesTokenTelemetry }
+    }
+
+    /// The runtime actually doing the work, which is NOT necessarily the one
+    /// with an HTTP API. Showing llama.cpp's model name while MLX is generating
+    /// was the app reporting a stale identity as if it were live.
+    var workingRuntime: RuntimeInfo? {
+        roster.first { $0.busy && !$0.exposesTokenTelemetry }
+            ?? (activeSlot != nil ? roster.first { $0.exposesTokenTelemetry && $0.residentBytes > 0 } : nil)
+            ?? roster.first { $0.residentBytes > 1_000_000_000 }
+    }
+
+    /// The GPU is clearly working, but nothing we can instrument accounts for
+    /// it. Saying "idle" here would be the same class of lie as rendering a
+    /// missing measurement as zero.
+    var unattributedActivity: String? {
+        guard let gpu = latestSystem?.gpuDevice, gpu > 0.5 else { return nil }
+        guard activeSlot == nil else { return nil }
+        if let r = busyOpaqueRuntime {
+            return "\(r.modelName ?? "MLX model") is generating on \(r.backend ?? "MLX"), which exposes no per-token telemetry"
+        }
+        return "GPU is at \(Int(gpu * 100))% but no instrumented endpoint accounts for it"
+    }
 
     /// Whole-system watts minus the idle floor: the marginal cost of inference.
     /// Far more interesting than total draw, and invisible without a baseline.

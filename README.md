@@ -149,6 +149,27 @@ every field they provide is now collected natively in microseconds. `llmctl`'s
 file-backed page cache from "used" is hard-won and non-obvious, because a
 20–46 GB mmap'd GGUF in the cache would otherwise read as memory pressure.
 
+## The MLX blind spot
+
+Bionic can host **two backends at once**: llama.cpp (GGUF) and MLX (safetensors).
+Only llama.cpp exposes `/slots`. The MLX runtime lives inside a `node` host as a
+child of Bionic, binds **no listening socket**, and speaks Bionic's internal IPC —
+so process-and-port discovery cannot see it at all.
+
+The first version of this app therefore showed llama.cpp's model name and
+"idle" while MLX was visibly generating at 98% GPU. That is the app breaking its
+own rule: reporting a stale identity as if it were live. Fixed by
+
+- asking LM Studio directly (`lms ps --json`, 240 ms, slow loop only) for what is
+  resident, and distinguishing MLX by `format: safetensors`;
+- picking the **working** runtime for the header rather than whichever one has an
+  HTTP API;
+- flagging **unattributed activity** — high GPU with no instrumented endpoint to
+  account for it — instead of reporting idle.
+
+For MLX we can honestly report residency, size, context and busy/idle, and
+nothing per-token. The Engines view labels it `no per-token telemetry`.
+
 ## Not measurable here
 
 - GPU/ANE wattage — needs root (`powermetrics`). Whole-system watts via

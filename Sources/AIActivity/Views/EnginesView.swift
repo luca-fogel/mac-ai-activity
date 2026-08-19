@@ -76,9 +76,22 @@ struct EngineRow: View {
             }
             .frame(width: 130, alignment: .leading)
 
-            Text(info.modelName?.replacingOccurrences(of: ".gguf", with: "") ?? "nothing resident")
-                .font(.system(size: 11)).foregroundStyle(resident ? T.inkSecondary : T.inkDisabled)
-                .frame(minWidth: 150, alignment: .leading).lineLimit(1)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(info.modelName?.replacingOccurrences(of: ".gguf", with: "") ?? "nothing resident")
+                    .font(.system(size: 11)).foregroundStyle(resident ? T.inkSecondary : T.inkDisabled)
+                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    if let b = info.backend {
+                        Text(b).font(.system(size: 9)).foregroundStyle(T.inkMuted)
+                    }
+                    if !info.exposesTokenTelemetry {
+                        Text("· no per-token telemetry")
+                            .font(.system(size: 9)).foregroundStyle(T.warning)
+                    }
+                    if info.busy { Chip(text: "generating", tint: T.good) }
+                }
+            }
+            .frame(minWidth: 150, alignment: .leading)
 
             Text(proc.map { Fmt.bytes($0.wired) } ?? Fmt.dash)
                 .font(T.mono).foregroundStyle(resident ? T.inkPrimary : T.inkDisabled)

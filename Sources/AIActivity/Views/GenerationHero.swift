@@ -16,7 +16,9 @@ struct GenerationHero: View {
                 VStack(alignment: .leading, spacing: 2) {
                     EstimateView(estimate: hub.joulesPerToken, unit: "J / token",
                                  font: T.hero, decimals: 1, compact: true)
-                    Text(hub.joulesPerToken.confidence.reason ?? "system draw ÷ emitted tok/s")
+                    Text(hub.unattributedActivity
+                         ?? hub.joulesPerToken.confidence.reason
+                         ?? "system draw ÷ emitted tok/s")
                         .font(.system(size: 10)).foregroundStyle(T.inkMuted)
                         .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: 230, alignment: .leading)
@@ -46,8 +48,13 @@ struct GenerationHero: View {
     }
 
     private var taskLabel: String {
-        guard let s = hub.activeSlot else { return "idle" }
-        return "slot \(s.id)" + (s.idTask.map { " · id_task \($0)" } ?? "")
+        if let s = hub.activeSlot {
+            return "slot \(s.id)" + (s.idTask.map { " · id_task \($0)" } ?? "")
+        }
+        if let r = hub.busyOpaqueRuntime {
+            return "\(r.backend ?? "MLX") · not instrumented"
+        }
+        return "idle"
     }
 
     private var marginalCaption: String? {

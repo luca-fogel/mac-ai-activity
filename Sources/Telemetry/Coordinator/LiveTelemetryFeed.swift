@@ -154,7 +154,22 @@ public actor LiveTelemetryFeed: TelemetryFeed {
                 machines[d.engine] = machines[d.engine] ?? SlotStateMachine()
             }
 
-            cont.yield(.roster(EngineRoster(t: t, runtimes: runtimes.map(rosterEntry))))
+            // Process discovery finds llama.cpp/LocalAI/Ollama. It CANNOT find
+            // the MLX backend -- that runs inside a node host with no listening
+            // socket -- so ask LM Studio directly for what it has resident.
+            var entries = runtimes.map(rosterEntry)
+            for m in LMStudioProbe.snapshot() where m.isMLX {
+                entries.append(RuntimeInfo(
+                    engine: .bionic, backend: "MLX", busy: m.isGenerating,
+                    exposesTokenTelemetry: false,          // no /slots equivalent
+                    endpoint: "Bionic IPC (no HTTP port)",
+                    modelName: m.identifier,
+                    quantization: m.architecture,
+                    nCtxFitted: m.contextLength,
+                    reachable: true,
+                    residentBytes: m.sizeBytes))
+            }
+            cont.yield(.roster(EngineRoster(t: t, runtimes: entries)))
 
             if let p = power.sample() {
                 cont.yield(.power(PowerSample(
@@ -171,7 +186,8 @@ public actor LiveTelemetryFeed: TelemetryFeed {
     private func rosterEntry(_ d: RuntimeDescriptor) -> RuntimeInfo {
         let ru = ProcSampler.rusage(d.generation.pid)
         return RuntimeInfo(
-            engine: d.engine, generation: d.generation,
+            engine: d.engine, backend: d.engine == .bionic ? "llama.cpp" : nil,
+            generation: d.generation,
             endpoint: "\(d.host):\(d.port)",
             modelName: d.facts.modelName, quantization: d.facts.quantization,
             nCtxFitted: d.facts.fittedContext,

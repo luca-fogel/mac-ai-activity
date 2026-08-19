@@ -6,7 +6,10 @@ import Telemetry
 struct StatusRail: View {
     @Environment(TelemetryHub.self) private var hub
 
-    private var bionic: RuntimeInfo? { hub.roster.first { $0.engine == .bionic } }
+    // The runtime actually doing the work -- NOT necessarily the one with an
+    // HTTP API. Bionic can host llama.cpp and MLX at once, and only llama.cpp
+    // exposes /slots.
+    private var bionic: RuntimeInfo? { hub.workingRuntime }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -24,6 +27,14 @@ struct StatusRail: View {
                 rateChips
                 Spacer(minLength: 8)
                 observerReceipt
+            }
+            if let note = hub.unattributedActivity {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9)).foregroundStyle(T.warning)
+                    Text(note).font(.system(size: 10)).foregroundStyle(T.warning)
+                        .lineLimit(1)
+                }
             }
         }
         .padding(.horizontal, T.padSection)
@@ -43,6 +54,7 @@ struct StatusRail: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(bionic == nil ? T.inkDisabled : T.inkPrimary)
                 HStack(spacing: 5) {
+                    if let b = bionic?.backend { Chip(text: b, tint: T.engineBionic) }
                     if let q = bionic?.quantization { Chip(text: q) }
                     if let s = bionic?.speculativeType { Chip(text: "spec \(s)") }
                     Text(hub.isGenerating ? "generating" : "idle")

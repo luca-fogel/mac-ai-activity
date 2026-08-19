@@ -366,6 +366,15 @@ public struct InferenceSample: Sendable {
 
 public struct RuntimeInfo: Sendable, Identifiable {
     public var engine: EngineID
+    /// "llama.cpp" or "MLX". One engine (Bionic) can host both, and only the
+    /// llama.cpp one exposes per-token telemetry.
+    public var backend: String?
+    /// Whether this runtime is doing work right now, when the runtime can tell
+    /// us that much even though it exposes no per-slot detail.
+    public var busy: Bool = false
+    /// True when this runtime provides no /slots-equivalent, so the inference
+    /// domain must report unavailable rather than idle.
+    public var exposesTokenTelemetry: Bool = true
     public var generation: EndpointGeneration?
     public var endpoint: String            // "127.0.0.1:56388" — never the key
     public var modelName: String?
@@ -382,9 +391,11 @@ public struct RuntimeInfo: Sendable, Identifiable {
     public var residentBytes: UInt64       // 0 = present but holding nothing
     public var requestsPerMinute: Double?
 
-    public var id: String { engine.rawValue }
+    public var id: String { "\(engine.rawValue)|\(backend ?? "-")|\(modelName ?? "-")" }
 
-    public init(engine: EngineID, generation: EndpointGeneration? = nil,
+    public init(engine: EngineID, backend: String? = nil, busy: Bool = false,
+                exposesTokenTelemetry: Bool = true,
+                generation: EndpointGeneration? = nil,
                 endpoint: String, modelName: String? = nil, quantization: String? = nil,
                 paramCount: Int64? = nil, fileBytes: UInt64? = nil,
                 nCtxReported: Int? = nil, nCtxFitted: Int? = nil,
@@ -392,7 +403,9 @@ public struct RuntimeInfo: Sendable, Identifiable {
                 flashAttention: Bool? = nil, loadMode: String? = nil,
                 reachable: Bool, residentBytes: UInt64 = 0,
                 requestsPerMinute: Double? = nil) {
-        self.engine = engine; self.generation = generation; self.endpoint = endpoint
+        self.engine = engine; self.backend = backend; self.busy = busy
+        self.exposesTokenTelemetry = exposesTokenTelemetry
+        self.generation = generation; self.endpoint = endpoint
         self.modelName = modelName; self.quantization = quantization
         self.paramCount = paramCount; self.fileBytes = fileBytes
         self.nCtxReported = nCtxReported; self.nCtxFitted = nCtxFitted
