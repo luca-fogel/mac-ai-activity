@@ -1,117 +1,208 @@
-# aienergy
+# AI Activity
 
-**Joules per token for local LLM inference on Apple silicon.** Root-free, and
-the only figure here that no other tool on the machine can produce.
+A live instrument panel for everything local-AI on this Mac. Observe-only,
+no persistence, native SwiftUI.
 
-```
-$ aienergy watch
-MODEL                    TOK   TOK/S     TTFT   W avg    J/TOK  NOTE
-qwen/qwen3.5-9b          463    46.5    1.52s    25.4    0.519
-qwen/qwen3.5-9b           42    63.8    1.51s    25.4    1.315
+```sh
+./build.sh              # build + ad-hoc sign + install to ~/Applications
+open -a "AI Activity"   # or Cmd-Space "AI Activity"
 ```
 
-Those two rows are the whole argument for the tool: same model, same wattage,
-**2.5x more energy per token** for the short generation, because a ~1.5 s
-time-to-first-token is amortised over 42 tokens instead of 463. That is a direct
-case for batching prompts rather than firing many small ones, and nothing else
-surfaces it.
+## What it shows
 
-## Use LM Studio for everything else
+| View | Answers |
+|---|---|
+| **Timeline** | What did that generation cost, and what happened when — token output, GPU, memory and power on one shared time axis |
+| **Slots** | What is each of llama-server's 4 slots doing, and with which sampler settings |
+| **Engines** | Which runtime is actually burning resources (hue is earned by residency) |
+| **Sources** (⌘I) | Per-source health, measured rates, observer cost, and what is *not* measurable |
 
-This deliberately does NOT compete with LM Studio. LM Studio already reports
-tokens per second and time to first token — in its own UI, and via
-`lms chat --stats` — and reports them well. It is also the source this tool reads
-from (`lms log stream --json --stats`).
+Headline metric: **joules per token** = system watts ÷ emitted tok/s, with the
+idle floor subtracted so you can see the marginal cost of inference.
 
-What LM Studio has no data for is **power**. So that is the entire scope here.
+## The six traps this was built around
 
-An earlier version of this project was a seven-panel SwiftUI instrument panel.
-It was removed: at idle five of its panels showed an em-dash, it duplicated
-numbers LM Studio already showed better, and the one genuinely new figure sat in
-9pt text under a divider. The library underneath it survives, because the traps
-it documents are real and were expensive to find. If you want it back it is in
-git history at `c67be80`.
+Each of these silently produces a plausible, wrong number. All are covered by
+tests in `Tests/TelemetryTests`.
 
-## Commands
+1. **Context fill has no honest single denominator.** `/slots` and `/props`
+   both report `n_ctx` = the *model maximum* (262144). `--fit-ctx` (16384) is a
+   fit *target*, not a ceiling — a live slot was observed holding 17,460 tokens,
+   i.e. 106% of it. The allocated per-slot window is not exposed anywhere, so
+   `ContextFill` publishes the absolute count, both ratios named, and marks the
+   real window `.unavailable`.
+2. **Idle slots serve frozen counters.** A never-used slot exposes only
+   `[id, is_processing, n_ctx, speculative]`; a previously-used idle slot
+   exposes stale values from its last request. Rates are computed only across
+   two consecutive `.processing` observations with the same `id_task`.
+3. **`n_prompt_tokens` grows during decode** (it is total context). Using it as
+   the cache-rate denominator makes the hit rate decay toward zero over a long
+   generation. Use `cache / (cache + processed)` — both freeze after prefill.
+4. **Backend CPU reads ~0.2% during generation.** llama.cpp blocks on a Metal
+   command-buffer wait, so the CPU thread sleeps. Any activity predicate keyed
+   on CPU reports idle through every inference. The Engines view explains this
+   rather than hiding it.
+5. **`/slots` emits raw control bytes inside JSON strings**, hard-failing
+   `JSONDecoder`. `LenientJSON` repairs them and counts the repairs.
+6. **`n_decoded` is not reset at request start.** Through the whole of prefill
+   it holds the *previous* request's final count. Measured: it read `400` — the
+   exact token count of the preceding run — for 14 s while
+   `n_prompt_tokens_processed` climbed 1106 → 1618 and the client had received
+   nothing, then reset to `11` the moment decode began. Deriving a rate from
+   that window produced a confident, entirely fictional "12.4 tok/s". Slots are
+   therefore classified `.prefilling` until the counter is proven trustworthy,
+   and `nDecoded` is published as `nil` until then.
 
+## Design rules
+
+- **`Optional` means absent.** A measurement is a number; the absence of one is
+  `—`. They are never confusable, in the types or on screen.
+- **Domains are never fused.** System samples at ~10 Hz, `/slots` at ~1 Hz,
+  power at ~0.25 Hz. Each carries its own timestamps; the UI aligns them on a
+  shared axis and never interpolates the slow ones onto the fast grid.
+- **Every derived number is an `Estimate`** carrying value, uncertainty, sample
+  count and confidence. TTFT is published as a bounded interval, never a point.
+- **Confidence maps to ink and decoration, never to hue.** Hue is spent on
+  engine identity (chrome only) and phase/status (plot areas only).
+- **Five source states, not two.** `absent` / `live` / `held` / `stale` / `dark`
+  are rendered as visually incommensurable, and the distinctions are load-bearing:
+  a stopped server is *absent*, not failed; a value whose source refreshes every
+  ~4 s is *held*, not stale; a push stream between events is *absent*, not stale;
+  and a source that has not answered yet is only *dark* once an attempt has
+  actually failed. Judged by one pure function, `Freshness.judge`, against a
+  per-source `FreshnessPolicy` — because these sources differ in kind, not merely
+  in rate.
+- **The observer effect is first-class.** Polling `/slots` occupies the decode
+  loop, so the app measures and displays its own cost, and offers a
+  minimum-perturbation cadence.
+
+## Measured cost
+
+Sampling and display are separate concerns, and only one of them is expensive.
+
+| | |
+|---|---|
+| `GPUAccelerator.sample()` | **26.9 µs** (vs 3.3 ms for the whole IORegistry dict, 22 ms shelling `ioreg`) |
+| `MachMemory.sample()` | **3.7 µs** |
+| Combined collector tick | **30.6 µs** |
+| **Whole collector feed, headless (no UI)** | **0.40% of one core** |
+| Window open, no data attached | 0.20% |
+| Window idle (1 Hz display) | **2.3%** |
+| Window during a generation (5 Hz display) | **11.4%** |
+| Window occluded | ~0 (display paused entirely) |
+
+The collection layer meets its budget with room to spare; essentially all the
+cost is SwiftUI re-laying-out the window, and it scales with the **display**
+rate, not the sample rate. So the display rate is adaptive — 1 Hz idle
+(Activity Monitor's own cadence), 5 Hz while generating — while **sampling stays
+at full rate regardless**, so no history is lost and nothing analytical is
+traded away. 10 Hz display was measured at 16.7% and judged not worth it.
+
+This matters less than it looks for perturbation: llama.cpp inference is
+GPU-bound and its own backend process uses ~0.2% CPU, so the app is not
+competing for the resource under test. The real perturbation risk is `/slots`
+polling, which is separately controlled in the Sources inspector.
+
+## Validating the app against ground truth
+
+`tools/testrun.py` fires a controlled prompt and reports the **real** TTFT and
+token count, because it *is* the client — something the app can never be. Use it
+to check the app rather than trusting it.
+
+```sh
+./tools/testrun.py --prompt cold      # long novel prompt: big prefill
+./tools/testrun.py --prompt regular   # low-entropy, speculation should thrive
+./tools/testrun.py --prompt entropy   # high-entropy, speculation should struggle
 ```
-aienergy watch      follow generations as they finish (default)
-aienergy status     what is resident, whether power is readable at all
-aienergy --json     NDJSON instead of a table
-```
 
-Neither command ever initiates a generation, and neither reads a prompt or a
-completion — see the privacy note under the CLI section below.
+`regular` and `entropy` are a matched pair: same shape, same token budget,
+deliberately different predictability. Since `/slots` exposes no accept/reject
+counters, the tok/s difference between them is the only observable signature of
+speculative decoding available.
 
-**Unplug to measure.** On AC, battery amperage reflects charging current rather
-than system load, so wattage is genuinely unavailable and `J/TOK` reads `—` with
-that reason. This is not a limitation that can be engineered around without
-lying.
+Measured 2026-08-18 on Qwen3.8-27B-Q5_K_M (M2 Max, on AC):
 
-## Install
+| run | TTFT | decode |
+|---|---|---|
+| regular (predictable table) | 13.56 s (cold buffers) | **8.72 tok/s** |
+| entropy (novel prose) | 1.42 s | **7.90 tok/s** |
+| cold (4.5k-token prompt, cache miss) | **55.4 s** | 4.62 tok/s |
+| cold (same prompt, cache hit) | **1.19 s** | 10.28 tok/s |
 
-```
-swift build -c release --product aienergy
-cp .build/release/aienergy ~/.local/bin/
-```
+The last two rows are the same prompt: prompt-cache reuse turned a 55 s wait into
+1.2 s, a **47x** difference. That is what the cache-reuse bar in the Slots view is
+measuring.
 
-No third-party dependencies: IOKit, mach and libproc only.
+### Replication of the regular-vs-entropy pair
 
-## How it works
+`tools/abtest.py` runs the pair counterbalanced and repeated, because the first
+attempt was confounded — `regular` ran first on cold GPU buffers.
 
-### Why retrospective integration is the RIGHT design here
+Two blocks of 6 alternating trials (12 runs, 300 tokens each), block 2 starting
+with the opposite condition:
 
-A receipt arrives when a prediction finishes, and it carries enough to
-reconstruct the generation's duration — so power sampled continuously in the
-background can be integrated over precisely that window, afterwards. That is
-strictly better than the GUI's approach of opening and closing an episode on the
-0.2 Hz roster clock, which missed any generation shorter than one poll: MEASURED,
-a 131-token generation finished in ~2.2 s and got no energy envelope at all.
+| | regular | entropy | raw difference | verdict |
+|---|---|---|---|---|
+| block 1 | 7.87 ± 0.70 | 7.32 ± 0.79 | +7.6% | within noise |
+| block 2 | 7.63 ± 0.39 | 7.42 ± 0.27 | +2.8% | within noise |
+| pooled, detrended | +0.152 | −0.152 | **+4.0%** | p = 0.024 (exact permutation, n=6 each) |
 
-Two things the integration refuses to do:
+**Neither block replicates on its own.** Run-to-run drift is the dominant term:
+block 1 fell **−0.37 tok/s per run (−22% over six runs)** while block 2 was flat
+(+0.09), so the drift is a settling artifact of the preceding cold runs rather
+than a general law. It is 5x larger than the effect being measured, which is
+why the original uncounterbalanced pair was almost certainly measuring drift.
 
-- **Integrate a window it did not observe.** A window starting before the trace
-  is `.unavailable` with the shortfall named, never a partial integral presented
-  as a whole one — that would understate energy and so understate J/token. The
-  trailing edge gets a small tolerance, because a sub-second tail is sampling
-  phase, not missing data, on a source that refreshes every ~4 s.
-- **Treat absent wattage as zero.** On AC there is no reading at all, and a zero
-  would integrate to a generation that apparently cost nothing.
+Pooling both blocks with within-block detrending, `regular` is 4.0% faster and
+an exact permutation test gives p = 0.024. Three caveats keep this modest:
+the detrending was chosen *after* seeing the drift; a single prompt pair
+confounds predictability with format (a numeric table vs prose, which differ in
+tokenization as well as entropy); and 4% is small next to the 22% drift. Treat
+it as a directional result that survived one replication attempt, not a
+measurement of draft acceptance.
 
-### `totalTimeSec` is not the generation's duration
+`swift run -c release telemetry-probe --cost` asserts the collector budget and
+fails on regression. `--live`, `--discover` and `--power` run the collectors
+headless.
 
-MEASURED: a generation with `timeToFirstTokenSec: 1.494` and 43 tokens at
-62.4 tok/s — about 2.18 s of real work — reported `totalTimeSec: 0.002`.
-Integrating power over a 2 ms window produced 0.07 J and a joules-per-token
-figure roughly 300x too small: plausible, precise, and wrong.
+## Why not reuse llmctl / qwen-control
 
-So duration is reconstructed from the two fields that ARE mutually consistent,
-`ttft + tokens/rate`, and the engine's own figure is trusted only when it can be
-checked against the TTFT it must contain. Where it cannot be checked, the result
-is `.low` confidence rather than `.high` — an unverifiable number does not earn
-the same standing as a verified one.
+`llmctl status --json` and `qwen-control`'s `/state` were evaluated and
+rejected as *runtime* dependencies: both shell out (175 ms for `/state`), and
+every field they provide is now collected natively in microseconds. `llmctl`'s
+`sysmem()` **formula** is preserved exactly in `MachMemory` — excluding
+file-backed page cache from "used" is hard-won and non-obvious, because a
+20–46 GB mmap'd GGUF in the cache would otherwise read as memory pressure.
 
-### Killing the child is harder than it looks
+## GGUF vs MLX, benchmarked
 
-`lms log stream` holds a subscription to every prompt on the machine, so an
-orphan is a privacy problem, not untidiness. Three mechanisms were tried and
-MEASURED failing before the fourth worked:
+`tools/ab-engines.py` runs both engines **interleaved** (not blocked), because
+run-to-run drift here was previously measured at -22% across six runs — five
+times the effect under test.
 
-1. Polling `kill -0 <our pid>` from a supervising shell — macOS **recycled the
-   pid**, an unrelated process inherited it, and the watchdog polled a stranger
-   forever while two streams kept running.
-2. Closing a pipe the child reads, so its read returns EOF on our death — did not
-   reliably reach the shell.
-3. Terminating the shell — strands the CLI, because the shell is the only thing
-   that would have killed it.
-4. **Reading the grandchild's pid from the process table and signalling it
-   directly**, plus an `EXIT/TERM/INT/HUP` trap in the shell for the crash case.
-   Verified reaped under SIGINT, SIGTERM and SIGKILL.
+Two blocks, 3 trials each, 220 tokens, identical prompt, Qwen3.8-27B:
 
-A fifth bug hid behind those: `^C` did nothing at all, because the
-`DispatchSource` was on `.main` while the main thread blocked in `sem.wait()`, so
-the handler never ran — and SIGINT was `SIG_IGN`'d for the source to work. The
-surviving child was never leaked; nothing had asked it to stop.
+| | mean | sd | TTFT |
+|---|---|---|---|
+| llama.cpp GGUF Q5_K_M | 7.56 tok/s | 0.33 | 4.77 s (sd 1.91) |
+| mlx-lm MLX 4-bit | **12.21 tok/s** | 1.33 | 9.21 s (sd 7.26) |
+
+**MLX is +61.4% on throughput**, with complete separation (slowest MLX run beat
+the fastest GGUF run) and an exact permutation test at **p = 0.0022**.
+
+Three things keep that from being the whole story:
+
+- **Precision differs.** 4-bit group-64 vs 5-bit K-quant. MLX has an advantage
+  going in, though 20% fewer bits does not obviously buy 61% more throughput.
+- **GGUF was handicapped in MLX's favour too**: it ran with speculative decoding
+  (`--spec-type draft-mtp`) and flash attention, and still lost.
+- **TTFT is much worse and 3.8x more variable on MLX** — it swung from 0.28 s on
+  a cache hit to 15.89 s on a miss. If you care about latency to first token
+  rather than sustained throughput, that reverses the recommendation.
+
+Energy per token could not be measured for this run: the machine was plugged in
+and charging, and `SystemLoad` reports net battery flow (negative) rather than
+system draw while charging. Unplug, or wait until the battery is full, to get it.
 
 ## The MLX blind spot
 
@@ -182,161 +273,81 @@ Three things the integration defends against, all measured rather than assumed:
 No prompt or completion text ever enters a `Sample`. `PredictionSample` has no
 field that could hold it — the same discipline `APIKey` applies to secrets.
 
-## The six traps this was built around
+## aienergy — the CLI
 
-Each of these silently produces a plausible, wrong number. All are covered by
-tests in `Tests/TelemetryTests`.
+LM Studio already reports tok/s and TTFT, in its own UI and via
+`lms chat --stats`, and reports them well. The one thing it has no data for is
+**energy**. So `aienergy` does only that part:
 
-1. **Context fill has no honest single denominator.** `/slots` and `/props`
-   both report `n_ctx` = the *model maximum* (262144). `--fit-ctx` (16384) is a
-   fit *target*, not a ceiling — a live slot was observed holding 17,460 tokens,
-   i.e. 106% of it. The allocated per-slot window is not exposed anywhere, so
-   `ContextFill` publishes the absolute count, both ratios named, and marks the
-   real window `.unavailable`.
-2. **Idle slots serve frozen counters.** A never-used slot exposes only
-   `[id, is_processing, n_ctx, speculative]`; a previously-used idle slot
-   exposes stale values from its last request. Rates are computed only across
-   two consecutive `.processing` observations with the same `id_task`.
-3. **`n_prompt_tokens` grows during decode** (it is total context). Using it as
-   the cache-rate denominator makes the hit rate decay toward zero over a long
-   generation. Use `cache / (cache + processed)` — both freeze after prefill.
-4. **Backend CPU reads ~0.2% during generation.** llama.cpp blocks on a Metal
-   command-buffer wait, so the CPU thread sleeps. Any activity predicate keyed
-   on CPU reports idle through every inference. `aienergy status` explains this
-   rather than hiding it.
-5. **`/slots` emits raw control bytes inside JSON strings**, hard-failing
-   `JSONDecoder`. `LenientJSON` repairs them and counts the repairs.
-6. **`n_decoded` is not reset at request start.** Through the whole of prefill
-   it holds the *previous* request's final count. Measured: it read `400` — the
-   exact token count of the preceding run — for 14 s while
-   `n_prompt_tokens_processed` climbed 1106 → 1618 and the client had received
-   nothing, then reset to `11` the moment decode began. Deriving a rate from
-   that window produced a confident, entirely fictional "12.4 tok/s". Slots are
-   therefore classified `.prefilling` until the counter is proven trustworthy,
-   and `nDecoded` is published as `nil` until then.
-
-## Measured cost
-
-| | |
-|---|---|
-| `GPUAccelerator.sample()` | **26.9 µs** (vs 3.3 ms for the whole IORegistry dict, 22 ms shelling `ioreg`) |
-| `MachMemory.sample()` | **3.7 µs** |
-| Combined collector tick | **30.6 µs** |
-| **Whole collector feed** | **0.40% of one core** |
-
-Cheap enough to ignore, which is the point: an instrument that materially
-perturbs what it measures is not measuring it. Two things this depends on:
-
-- **The prediction stream is push, not poll.** A whole generation costs ONE line
-  of NDJSON. There is nothing to tune.
-- **`/slots` is the only expensive source**, at 100–450 ms per call, because
-  llama.cpp serialises it behind the decode loop. It is polled at most 1 Hz and
-  never for MLX, which has no `/slots` at all.
-
-The earlier GUI's cost was almost entirely SwiftUI re-laying out its window
-(2.3% idle, 11.4% during a generation, against 0.40% for the collectors it was
-supposedly measuring) — which is a large part of why it is gone.
-
-## GGUF vs MLX, benchmarked
-
-`tools/ab-engines.py` runs both engines **interleaved** (not blocked), because
-run-to-run drift here was previously measured at -22% across six runs — five
-times the effect under test.
-
-Two blocks, 3 trials each, 220 tokens, identical prompt, Qwen3.8-27B:
-
-| | mean | sd | TTFT |
-|---|---|---|---|
-| llama.cpp GGUF Q5_K_M | 7.56 tok/s | 0.33 | 4.77 s (sd 1.91) |
-| mlx-lm MLX 4-bit | **12.21 tok/s** | 1.33 | 9.21 s (sd 7.26) |
-
-**MLX is +61.4% on throughput**, with complete separation (slowest MLX run beat
-the fastest GGUF run) and an exact permutation test at **p = 0.0022**.
-
-Three things keep that from being the whole story:
-
-- **Precision differs.** 4-bit group-64 vs 5-bit K-quant. MLX has an advantage
-  going in, though 20% fewer bits does not obviously buy 61% more throughput.
-- **GGUF was handicapped in MLX's favour too**: it ran with speculative decoding
-  (`--spec-type draft-mtp`) and flash attention, and still lost.
-- **TTFT is much worse and 3.8x more variable on MLX** — it swung from 0.28 s on
-  a cache hit to 15.89 s on a miss. If you care about latency to first token
-  rather than sustained throughput, that reverses the recommendation.
-
-Energy per token could not be measured for this run: the machine was plugged in
-and charging, and `SystemLoad` reports net battery flow (negative) rather than
-system draw while charging. Unplug, or wait until the battery is full, to get it.
-
-## Validating against ground truth
-
-`tools/testrun.py` fires a controlled prompt and reports the **real** TTFT and
-token count, because it *is* the client — something the app can never be. Use it
-to check the app rather than trusting it.
-
-```sh
-./tools/testrun.py --prompt cold      # long novel prompt: big prefill
-./tools/testrun.py --prompt regular   # low-entropy, speculation should thrive
-./tools/testrun.py --prompt entropy   # high-entropy, speculation should struggle
+```
+$ aienergy watch
+MODEL                    TOK   TOK/S     TTFT   W avg    J/TOK  NOTE
+qwen/qwen3.5-9b          463    46.5    1.52s    25.4    0.519
+qwen/qwen3.5-9b           42    63.8    1.51s    25.4    1.315
 ```
 
-`regular` and `entropy` are a matched pair: same shape, same token budget,
-deliberately different predictability. Since `/slots` exposes no accept/reject
-counters, the tok/s difference between them is the only observable signature of
-speculative decoding available.
+Those two rows are the point: the same model at the same wattage costs **2.5x
+more energy per token** for a short generation, because a ~1.5 s time-to-first-
+token is amortised over 42 tokens instead of 463. Nothing else on the machine
+surfaces that.
 
-Measured 2026-08-18 on Qwen3.8-27B-Q5_K_M (M2 Max, on AC):
+`aienergy status` reports what is resident and whether power is readable at all.
+`--json` emits NDJSON. Neither ever initiates a generation, and neither reads a
+prompt or a completion.
 
-| run | TTFT | decode |
-|---|---|---|
-| regular (predictable table) | 13.56 s (cold buffers) | **8.72 tok/s** |
-| entropy (novel prose) | 1.42 s | **7.90 tok/s** |
-| cold (4.5k-token prompt, cache miss) | **55.4 s** | 4.62 tok/s |
-| cold (same prompt, cache hit) | **1.19 s** | 10.28 tok/s |
+### Why retrospective integration is the RIGHT design here
 
-The last two rows are the same prompt: prompt-cache reuse turned a 55 s wait into
-1.2 s, a **47x** difference. That is what the cache-reuse bar in the Slots view is
-measuring.
+A receipt arrives when a prediction finishes, and it carries enough to
+reconstruct the generation's duration — so power sampled continuously in the
+background can be integrated over precisely that window, afterwards. That is
+strictly better than the GUI's approach of opening and closing an episode on the
+0.2 Hz roster clock, which missed any generation shorter than one poll: MEASURED,
+a 131-token generation finished in ~2.2 s and got no energy envelope at all.
 
-### Replication of the regular-vs-entropy pair
+Two things the integration refuses to do:
 
-`tools/abtest.py` runs the pair counterbalanced and repeated, because the first
-attempt was confounded — `regular` ran first on cold GPU buffers.
+- **Integrate a window it did not observe.** A window starting before the trace
+  is `.unavailable` with the shortfall named, never a partial integral presented
+  as a whole one — that would understate energy and so understate J/token. The
+  trailing edge gets a small tolerance, because a sub-second tail is sampling
+  phase, not missing data, on a source that refreshes every ~4 s.
+- **Treat absent wattage as zero.** On AC there is no reading at all, and a zero
+  would integrate to a generation that apparently cost nothing.
 
-Two blocks of 6 alternating trials (12 runs, 300 tokens each), block 2 starting
-with the opposite condition:
+### `totalTimeSec` is not the generation's duration
 
-| | regular | entropy | raw difference | verdict |
-|---|---|---|---|---|
-| block 1 | 7.87 ± 0.70 | 7.32 ± 0.79 | +7.6% | within noise |
-| block 2 | 7.63 ± 0.39 | 7.42 ± 0.27 | +2.8% | within noise |
-| pooled, detrended | +0.152 | −0.152 | **+4.0%** | p = 0.024 (exact permutation, n=6 each) |
+MEASURED: a generation with `timeToFirstTokenSec: 1.494` and 43 tokens at
+62.4 tok/s — about 2.18 s of real work — reported `totalTimeSec: 0.002`.
+Integrating power over a 2 ms window produced 0.07 J and a joules-per-token
+figure roughly 300x too small: plausible, precise, and wrong.
 
-**Neither block replicates on its own.** Run-to-run drift is the dominant term:
-block 1 fell **−0.37 tok/s per run (−22% over six runs)** while block 2 was flat
-(+0.09), so the drift is a settling artifact of the preceding cold runs rather
-than a general law. It is 5x larger than the effect being measured, which is
-why the original uncounterbalanced pair was almost certainly measuring drift.
+So duration is reconstructed from the two fields that ARE mutually consistent,
+`ttft + tokens/rate`, and the engine's own figure is trusted only when it can be
+checked against the TTFT it must contain. Where it cannot be checked, the result
+is `.low` confidence rather than `.high` — an unverifiable number does not earn
+the same standing as a verified one.
 
-Pooling both blocks with within-block detrending, `regular` is 4.0% faster and
-an exact permutation test gives p = 0.024. Three caveats keep this modest:
-the detrending was chosen *after* seeing the drift; a single prompt pair
-confounds predictability with format (a numeric table vs prose, which differ in
-tokenization as well as entropy); and 4% is small next to the 22% drift. Treat
-it as a directional result that survived one replication attempt, not a
-measurement of draft acceptance.
+### Killing the child is harder than it looks
 
-`swift run -c release telemetry-probe --cost` asserts the collector budget and
-fails on regression. `--live`, `--discover` and `--power` run the collectors
-headless.
+`lms log stream` holds a subscription to every prompt on the machine, so an
+orphan is a privacy problem, not untidiness. Three mechanisms were tried and
+MEASURED failing before the fourth worked:
 
-## Why not reuse llmctl / qwen-control
+1. Polling `kill -0 <our pid>` from a supervising shell — macOS **recycled the
+   pid**, an unrelated process inherited it, and the watchdog polled a stranger
+   forever while two streams kept running.
+2. Closing a pipe the child reads, so its read returns EOF on our death — did not
+   reliably reach the shell.
+3. Terminating the shell — strands the CLI, because the shell is the only thing
+   that would have killed it.
+4. **Reading the grandchild's pid from the process table and signalling it
+   directly**, plus an `EXIT/TERM/INT/HUP` trap in the shell for the crash case.
+   Verified reaped under SIGINT, SIGTERM and SIGKILL.
 
-`llmctl status --json` and `qwen-control`'s `/state` were evaluated and
-rejected as *runtime* dependencies: both shell out (175 ms for `/state`), and
-every field they provide is now collected natively in microseconds. `llmctl`'s
-`sysmem()` **formula** is preserved exactly in `MachMemory` — excluding
-file-backed page cache from "used" is hard-won and non-obvious, because a
-20–46 GB mmap'd GGUF in the cache would otherwise read as memory pressure.
+A fifth bug hid behind those: `^C` did nothing at all, because the
+`DispatchSource` was on `.main` while the main thread blocked in `sem.wait()`, so
+the handler never ran — and SIGINT was `SIG_IGN`'d for the source to work. The
+surviving child was never leaked; nothing had asked it to stop.
 
 ## Not measurable here
 
