@@ -273,6 +273,82 @@ Three things the integration defends against, all measured rather than assumed:
 No prompt or completion text ever enters a `Sample`. `PredictionSample` has no
 field that could hold it — the same discipline `APIKey` applies to secrets.
 
+## aienergy — the CLI
+
+LM Studio already reports tok/s and TTFT, in its own UI and via
+`lms chat --stats`, and reports them well. The one thing it has no data for is
+**energy**. So `aienergy` does only that part:
+
+```
+$ aienergy watch
+MODEL                    TOK   TOK/S     TTFT   W avg    J/TOK  NOTE
+qwen/qwen3.5-9b          463    46.5    1.52s    25.4    0.519
+qwen/qwen3.5-9b           42    63.8    1.51s    25.4    1.315
+```
+
+Those two rows are the point: the same model at the same wattage costs **2.5x
+more energy per token** for a short generation, because a ~1.5 s time-to-first-
+token is amortised over 42 tokens instead of 463. Nothing else on the machine
+surfaces that.
+
+`aienergy status` reports what is resident and whether power is readable at all.
+`--json` emits NDJSON. Neither ever initiates a generation, and neither reads a
+prompt or a completion.
+
+### Why retrospective integration is the RIGHT design here
+
+A receipt arrives when a prediction finishes, and it carries enough to
+reconstruct the generation's duration — so power sampled continuously in the
+background can be integrated over precisely that window, afterwards. That is
+strictly better than the GUI's approach of opening and closing an episode on the
+0.2 Hz roster clock, which missed any generation shorter than one poll: MEASURED,
+a 131-token generation finished in ~2.2 s and got no energy envelope at all.
+
+Two things the integration refuses to do:
+
+- **Integrate a window it did not observe.** A window starting before the trace
+  is `.unavailable` with the shortfall named, never a partial integral presented
+  as a whole one — that would understate energy and so understate J/token. The
+  trailing edge gets a small tolerance, because a sub-second tail is sampling
+  phase, not missing data, on a source that refreshes every ~4 s.
+- **Treat absent wattage as zero.** On AC there is no reading at all, and a zero
+  would integrate to a generation that apparently cost nothing.
+
+### `totalTimeSec` is not the generation's duration
+
+MEASURED: a generation with `timeToFirstTokenSec: 1.494` and 43 tokens at
+62.4 tok/s — about 2.18 s of real work — reported `totalTimeSec: 0.002`.
+Integrating power over a 2 ms window produced 0.07 J and a joules-per-token
+figure roughly 300x too small: plausible, precise, and wrong.
+
+So duration is reconstructed from the two fields that ARE mutually consistent,
+`ttft + tokens/rate`, and the engine's own figure is trusted only when it can be
+checked against the TTFT it must contain. Where it cannot be checked, the result
+is `.low` confidence rather than `.high` — an unverifiable number does not earn
+the same standing as a verified one.
+
+### Killing the child is harder than it looks
+
+`lms log stream` holds a subscription to every prompt on the machine, so an
+orphan is a privacy problem, not untidiness. Three mechanisms were tried and
+MEASURED failing before the fourth worked:
+
+1. Polling `kill -0 <our pid>` from a supervising shell — macOS **recycled the
+   pid**, an unrelated process inherited it, and the watchdog polled a stranger
+   forever while two streams kept running.
+2. Closing a pipe the child reads, so its read returns EOF on our death — did not
+   reliably reach the shell.
+3. Terminating the shell — strands the CLI, because the shell is the only thing
+   that would have killed it.
+4. **Reading the grandchild's pid from the process table and signalling it
+   directly**, plus an `EXIT/TERM/INT/HUP` trap in the shell for the crash case.
+   Verified reaped under SIGINT, SIGTERM and SIGKILL.
+
+A fifth bug hid behind those: `^C` did nothing at all, because the
+`DispatchSource` was on `.main` while the main thread blocked in `sem.wait()`, so
+the handler never ran — and SIGINT was `SIG_IGN`'d for the source to work. The
+surviving child was never leaked; nothing had asked it to stop.
+
 ## Not measurable here
 
 - GPU/ANE wattage — needs root (`powermetrics`). Whole-system watts via

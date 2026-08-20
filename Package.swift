@@ -16,6 +16,9 @@ let package = Package(
         // Headless verifier: proves the collectors and their cost budget
         // without any UI. `swift run telemetry-probe --cost`
         .executableTarget(name: "telemetry-probe", dependencies: ["Telemetry"]),
+        // The CLI. LM Studio already shows tok/s and TTFT well; the one thing it
+        // cannot show is energy, so this tool does only that part.
+        .executableTarget(name: "aienergy", dependencies: ["Telemetry"]),
         .testTarget(name: "TelemetryTests", dependencies: ["Telemetry"]),
     ]
 )

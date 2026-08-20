@@ -450,6 +450,47 @@ public struct PredictionSample: Sendable {
     /// than presenting an engine-reported number as its own measurement.
     public var source: String
 
+    /// How long the generation actually took, wall-clock.
+    ///
+    /// **`totalTimeSec` is NOT this**, despite the name. MEASURED against the
+    /// live engine: a generation reporting `ttft 1.494 s` and 43 tokens at
+    /// 62.4 tok/s — i.e. ~2.18 s of real work — reported
+    /// `totalTimeSec: 0.002`. Whatever that field counts, it is not the
+    /// generation's duration, and integrating power over a 2 ms window produced
+    /// 0.07 J and a joules-per-token figure ~300x too small.
+    ///
+    /// So the duration is derived from the two fields that ARE mutually
+    /// consistent: time to first token, plus tokens divided by the rate at
+    /// which they were produced. `totalTimeSec` is used only when it is at
+    /// least as large as the TTFT it must contain, which is the cheapest
+    /// available plausibility check.
+    public var observedDuration: Estimate<Double> {
+        let derived: Double? = {
+            guard let ttft = timeToFirstToken.value,
+                  let n = predictedTokens, n > 0,
+                  let rate = tokensPerSecond.value, rate > 0 else { return nil }
+            return ttft + Double(n) / rate
+        }()
+
+        // Trust the engine's own figure only when it can actually be CHECKED:
+        // it must contain the TTFT it necessarily includes. With no TTFT to
+        // check against there is no plausibility test available, and given the
+        // field has been measured returning 0.002 for a 2.2 s generation,
+        // claiming high confidence on an unverifiable value is not warranted.
+        if let total = totalSeconds, total > 0, let ttft = timeToFirstToken.value {
+            if total >= ttft { return .high(total) }
+        }
+        if let d = derived {
+            // Low, not high: this is a reconstruction from two averages, not a
+            // clock reading.
+            return .low(d, n: 2)
+        }
+        if let total = totalSeconds, total > 0 {
+            return .low(total, n: 1)
+        }
+        return .unavailable("no usable duration: totalTimeSec implausible and rate or TTFT missing")
+    }
+
     public init(t: Instant, engine: EngineID, modelIdentifier: String,
                 stopReason: String,
                 tokensPerSecond: Estimate<Double>,

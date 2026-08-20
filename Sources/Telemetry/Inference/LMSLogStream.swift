@@ -36,8 +36,17 @@ import Foundation
 ///     `lms log stream` running indefinitely. It never writes when no model is
 ///     loaded, so it never takes SIGPIPE from the closed pipe, and macOS has no
 ///     equivalent of Linux's `PR_SET_PDEATHSIG`. An orphan here is not merely
-///     untidy: it holds a live subscription to every prompt on the machine. So
-///     the child runs under a shell that watches our pid and kills it when we go.
+///     untidy: it holds a live subscription to every prompt on the machine.
+///
+///     The child therefore runs under a shell that dies when we do, and the
+///     mechanism matters. Polling `kill -0 <our pid>` was the first attempt and
+///     it FAILED in testing: macOS recycled the pid, some unrelated process
+///     inherited it, and the watchdog polled a stranger forever while two
+///     orphans kept streaming. So the shell instead blocks reading a pipe whose
+///     write end only WE hold. When this process dies the descriptor closes,
+///     the read returns EOF, and the child is killed — immediately, and immune
+///     to pid reuse because no pid is consulted. The pid poll is kept only as a
+///     slow backstop.
 ///   * **The upstream API is named `unstable_streamLogs`.** Every stats field
 ///     is optional in the engine's own schema, and `stats` itself is optional.
 ///     A shape change must degrade to `.unavailable`, never crash and never
@@ -71,6 +80,8 @@ public actor LMSLogStream {
     /// stream reports under, without awaiting the actor.
     public nonisolated let engine: EngineID
     private var child: Process?
+    /// Held open for the lifetime of the child; see runOnce().
+    private var deathPipe: Pipe?
     private var pump: Task<Void, Never>?
     private var running = false
 
@@ -160,15 +171,33 @@ public actor LMSLogStream {
     /// every prompt on the machine. The shell polls our pid and terminates the
     /// child once we stop existing. `exec` is deliberately NOT used for the
     /// inner command: the shell has to outlive it in order to do the watching.
+    /// Builds the parent-death watchdog script.
+    ///
+    /// `cat > /dev/null` blocks on stdin, which is a pipe whose write end this
+    /// process holds and never writes to. Our death closes it, the read returns
+    /// EOF, and the kill fires. The trailing pid poll is a backstop for the case
+    /// where stdin is somehow already closed; it is NOT the primary mechanism,
+    /// because a recycled pid makes it unreliable.
+    ///
+    /// `exec` is deliberately not used for the inner command: the shell has to
+    /// outlive it in order to do the watching.
     static func watchdogInvocation(cli: String, ppid: Int32) -> [String] {
         func shellQuote(_ s: String) -> String {
             "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
         }
         let command = ([cli] + arguments).map(shellQuote).joined(separator: " ")
-        let script = command + " &\n"
+        // The trap is what makes this correct under BOTH shutdown paths, and it
+        // was added because the second one was measured failing: closing the
+        // pipe works, but a caller that also signals the shell would otherwise
+        // kill the very process responsible for reaping the CLI, stranding it.
+        // With an EXIT/TERM/INT trap, the child dies no matter how the shell
+        // goes away.
+        let script = "child=''\n"
+            + "trap 'kill \"$child\" 2>/dev/null' EXIT TERM INT HUP\n"
+            + command + " &\n"
             + "child=$!\n"
+            + "cat > /dev/null 2>&1\n"
             + "while kill -0 \(ppid) 2>/dev/null; do sleep 2; done\n"
-            + "kill \"$child\" 2>/dev/null\n"
         return ["-c", script]
     }
 
@@ -182,7 +211,13 @@ public actor LMSLogStream {
         // Never 2>&1: the banner and every logger line are on stderr, and
         // merging them would put non-JSON into the NDJSON.
         p.standardError = FileHandle.nullDevice
-        p.standardInput = FileHandle.nullDevice
+        // The death signal. We hold the write end and never write to it, so the
+        // watchdog's read blocks until this process exits. Retained as a stored
+        // property on purpose: if the Pipe were deallocated the descriptor would
+        // close and the watchdog would kill the child immediately.
+        let death = Pipe()
+        p.standardInput = death
+        self.deathPipe = death
 
         do { try p.run() } catch {
             return .couldNotLaunch((error as NSError).localizedDescription)
@@ -203,23 +238,48 @@ public actor LMSLogStream {
         p.waitUntilExit()
         let code = p.terminationStatus
         child = nil
-        // Draining stdout to EOF is what reaps the child; nothing is left
-        // behind for a restart to trip over.
+        // Releasing this closes our write end. Harmless now — the child has
+        // already exited — but it must not be released while it is running.
+        deathPipe = nil
         return code == 0 ? .cleanExit : .failed(code)
     }
 
     private func terminateChild() {
+        // Close our end of the death pipe FIRST and let the watchdog do the
+        // work. Signalling the shell directly is worse than useless: the shell
+        // is the thing that runs `kill "$child"`, so killing it strands the CLI
+        // it was supposed to reap — MEASURED as one surviving orphan per ^C.
+        // Closing the descriptor makes the shell's read return EOF, so it kills
+        // the child and exits on its own.
+        if let d = deathPipe {
+            try? d.fileHandleForWriting.close()
+            deathPipe = nil
+        }
         guard let c = child, c.isRunning else { return }
         // SIGTERM is handled by the CLI: it unsubscribes, disposes its client
         // and exits 0. Verified. But `child` is the watchdog shell now, and
         // signalling only the shell would leave the CLI behind — so signal the
         // whole group, which Process makes the shell the leader of.
-        let pid = c.processIdentifier
-        if pid > 0, killpg(pid, SIGTERM) != 0 {
-            // Not a group leader after all: fall back to the shell, whose
-            // watchdog then reaps the CLI within its poll interval.
-            c.terminate()
+        // Then signal the actual CLI directly, by pid.
+        //
+        // MEASURED, three ways: closing the pipe did not reliably reach the
+        // shell's read, polling our pid broke under pid reuse, and terminating
+        // the shell stranded the very process it was meant to reap. None of
+        // those are load-bearing any more — the grandchild's pid is read from
+        // the process table and signalled directly, which needs nothing to
+        // cooperate. `lms` handles SIGTERM by unsubscribing and exiting 0.
+        let shell = c.processIdentifier
+        if shell > 0 {
+            for grandchild in ProcSampler.children(of: shell) {
+                kill(grandchild, SIGTERM)
+            }
         }
+        // Now the shell, whose trap covers anything spawned since the scan.
+        for _ in 0..<20 {
+            if !c.isRunning { break }
+            usleep(25_000)
+        }
+        if c.isRunning { c.terminate() }
         child = nil
     }
 

@@ -45,6 +45,29 @@ public enum ProcSampler {
     }
 
     /// Process start time, used with the pid to form a reuse-safe identity.
+    /// Direct children of `pid`, read natively from the process table.
+    ///
+    /// Needed because a supervising shell cannot be relied upon to reap its own
+    /// child: MEASURED, terminating the shell left `lms log stream` running, and
+    /// the shell is the only thing that would have killed it. Knowing the
+    /// grandchild's pid lets the owner signal it directly instead of hoping.
+    public static func children(of pid: Int32) -> [Int32] {
+        let n = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
+        guard n > 0 else { return [] }
+        var pids = [Int32](repeating: 0, count: Int(n) / 4 + 64)
+        let got = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &pids,
+                               Int32(pids.count * 4))
+        guard got > 0 else { return [] }
+        var out: [Int32] = []
+        for i in 0..<(Int(got) / 4) where pids[i] > 0 {
+            var bi = proc_bsdinfo()
+            let sz = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(pids[i], PROC_PIDTBSDINFO, 0, &bi, sz) == sz else { continue }
+            if Int32(bitPattern: bi.pbi_ppid) == pid { out.append(pids[i]) }
+        }
+        return out
+    }
+
     public static func startedAt(_ pid: Int32) -> UInt64? {
         var bi = proc_bsdinfo()
         let sz = Int32(MemoryLayout<proc_bsdinfo>.size)

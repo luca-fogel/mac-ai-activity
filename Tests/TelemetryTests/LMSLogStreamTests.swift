@@ -202,15 +202,33 @@ final class LMSLogStreamTests: XCTestCase {
 /// takes SIGPIPE from the closed pipe.
 final class LMSLogStreamLifecycleTests: XCTestCase {
 
-    func testWatchdogScriptBackgroundsTheCLIAndPollsTheParent() {
+    func testWatchdogScriptBackgroundsTheCLIAndWatchesForParentDeath() {
         let argv = LMSLogStream.watchdogInvocation(cli: "/bin/echo", ppid: 4242)
         XCTAssertEqual(argv.first, "-c")
         let script = argv[1]
         XCTAssertTrue(script.contains("'/bin/echo'"), script)
         XCTAssertTrue(script.contains("--filter' 'output'"), script)
         XCTAssertTrue(script.contains("child=$!"), script)
+        // EOF on stdin is the PRIMARY mechanism: immune to pid reuse, which
+        // was measured breaking the poll-only version.
+        XCTAssertTrue(script.contains("cat > /dev/null"), script)
+        // The pid poll is retained only as a slow backstop.
         XCTAssertTrue(script.contains("kill -0 4242"), script)
-        XCTAssertTrue(script.contains("kill \"$child\""), script)
+    }
+
+    func testWatchdogTrapsSoTheChildDiesEvenIfTheShellIsSignalled() {
+        // MEASURED: without this, terminating the shell stranded the CLI,
+        // because the shell is the thing that runs the kill.
+        let script = LMSLogStream.watchdogInvocation(cli: "/bin/echo", ppid: 1)[1]
+        XCTAssertTrue(script.contains("trap"), script)
+        for sig in ["EXIT", "TERM", "INT", "HUP"] {
+            XCTAssertTrue(script.contains(sig), "trap must cover \(sig): \(script)")
+        }
+        // The trap must be armed BEFORE the child is spawned, or a fast signal
+        // slips through the gap.
+        let trapAt = script.range(of: "trap")!.lowerBound
+        let spawnAt = script.range(of: "child=$!")!.lowerBound
+        XCTAssertLessThan(trapAt, spawnAt, "trap must be installed first")
     }
 
     func testWatchdogQuotesPathsSoASpaceCannotSplitTheCommand() {
@@ -251,5 +269,68 @@ final class LMSLogStreamLifecycleTests: XCTestCase {
         XCTAssertEqual(bad, 0)
         XCTAssertEqual(preds, 0)
         XCTAssertEqual(s.engine, .bionic)
+    }
+}
+
+/// How long a generation took.
+///
+/// MEASURED against the live engine: `totalTimeSec` reported **0.002** for a
+/// generation with TTFT 1.494 s and 43 tokens at 62.4 tok/s — about 2.18 s of
+/// real work. Integrating power over a 2 ms window yielded 0.07 J and a
+/// joules-per-token figure ~300x too small, which is exactly the kind of
+/// plausible-but-wrong number this app exists to refuse.
+final class ObservedDurationTests: XCTestCase {
+
+    private func sample(totalSeconds: Double?, ttft: Double?, tokens: Int?,
+                        tps: Double?) -> PredictionSample {
+        PredictionSample(
+            t: Instant(100), engine: .bionic, modelIdentifier: "m",
+            stopReason: "eosFound",
+            tokensPerSecond: tps.map { .high($0) } ?? .unavailable("absent"),
+            timeToFirstToken: ttft.map { .high($0) } ?? .unavailable("absent"),
+            draftAccepted: .unavailable("no draft model"),
+            totalSeconds: totalSeconds, promptTokens: 54,
+            predictedTokens: tokens, source: "test")
+    }
+
+    func testTheMeasuredBogusTotalTimeIsRejectedAndTheDurationReconstructed() {
+        let p = sample(totalSeconds: 0.002, ttft: 1.494, tokens: 43, tps: 62.3975)
+        let d = p.observedDuration
+        XCTAssertEqual(d.value!, 1.494 + 43 / 62.3975, accuracy: 1e-6)
+        XCTAssertEqual(d.value!, 2.183, accuracy: 0.01)
+        // A reconstruction from two averages is not a clock reading.
+        XCTAssertEqual(d.confidence, .low)
+    }
+
+    func testAPlausibleTotalTimeIsTrusted() {
+        let p = sample(totalSeconds: 38.3, ttft: 14.632, tokens: 229, tps: 5.979)
+        XCTAssertEqual(p.observedDuration.value!, 38.3, accuracy: 1e-9)
+        XCTAssertEqual(p.observedDuration.confidence, .high)
+    }
+
+    func testATotalTimeSmallerThanItsOwnTTFTCannotBeADuration() {
+        // The plausibility check: a duration must contain its own prefill.
+        let p = sample(totalSeconds: 1.0, ttft: 14.632, tokens: 229, tps: 5.979)
+        XCTAssertGreaterThan(p.observedDuration.value!, 14.632)
+        XCTAssertEqual(p.observedDuration.confidence, .low)
+    }
+
+    func testFallsBackToTheReportedFigureWhenNothingElseIsAvailable() {
+        let p = sample(totalSeconds: 5.0, ttft: nil, tokens: nil, tps: nil)
+        XCTAssertEqual(p.observedDuration.value!, 5.0, accuracy: 1e-9)
+        XCTAssertEqual(p.observedDuration.confidence, .low)
+    }
+
+    func testNoUsableDurationIsUnavailableRatherThanZero() {
+        let p = sample(totalSeconds: nil, ttft: nil, tokens: nil, tps: nil)
+        XCTAssertNil(p.observedDuration.value)
+        XCTAssertFalse(p.observedDuration.confidence.isAvailable)
+    }
+
+    func testZeroTokensDoesNotDivideByAnythingUnsafe() {
+        let p = sample(totalSeconds: 0.002, ttft: 1.5, tokens: 0, tps: 0)
+        // Cannot reconstruct, and 0.002 is below its own TTFT, so it degrades.
+        XCTAssertEqual(p.observedDuration.value!, 0.002, accuracy: 1e-9)
+        XCTAssertEqual(p.observedDuration.confidence, .low)
     }
 }
