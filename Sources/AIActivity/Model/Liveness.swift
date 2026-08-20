@@ -1,24 +1,9 @@
 import Foundation
 import Telemetry
 
-/// A source's freshness. The four states are rendered as visually
-/// incommensurable, not merely tinted: a source going dark must never look
-/// like a source reading zero.
-enum Liveness: Equatable {
-    /// No server of this kind is running. Distinct from `dark`: nothing has
-    /// failed, there is simply nothing there. Reporting a stopped server as
-    /// "connection refused" reads as a fault the user should act on.
-    case absent(String)
-    case live(hz: Double, jitter: Double)
-    /// The value is real but the source has not refreshed yet — battery power
-    /// updates only every few seconds. Full ink, but badged with its age.
-    case held(age: Double)
-    case stale(age: Double)
-    case dark(reason: String)
-
-    var isDark: Bool { if case .dark = self { return true }; return false }
-    var isAbsent: Bool { if case .absent = self { return true }; return false }
-}
+/// The five-state ladder now lives in `Telemetry` (see `Freshness.swift`) so it
+/// can be tested without a UI. This alias keeps every view's call sites intact.
+typealias Liveness = Freshness
 
 /// Tracks measured arrival rates per source. The Hz shown in the UI is
 /// measured, not the configured setting — otherwise it would just be
@@ -28,7 +13,9 @@ final class SourceTracker {
     struct State {
         var lastAt: Instant?
         var intervals: [Double] = []
-        var lastOutcome: Outcome = .ok
+        /// nil until an attempt has actually completed. A failed attempt and a
+        /// not-yet-finished attempt are different facts and must not be merged.
+        var lastOutcome: Outcome?
         var consecutiveFailures = 0
         var latencies: [Double] = []
     }
@@ -58,20 +45,27 @@ final class SourceTracker {
         states[k] = st
     }
 
+    /// Gathers this source's measured history and hands the judgement to
+    /// `Freshness.judge`. The caller supplies what only it can know: whether a
+    /// source of this kind is there at all, and — for a slow-refreshing value —
+    /// when that value last moved.
     func liveness(_ s: SourceKind, _ e: EngineID?, now: Instant,
-                  expected: Double) -> Liveness {
-        let k = Self.key(s, e)
-        guard let st = states[k], let last = st.lastAt else {
-            return .dark(reason: states[k]?.lastOutcome.shortReason ?? "no samples yet")
-        }
-        if st.consecutiveFailures >= 3 {
-            return .dark(reason: st.lastOutcome.shortReason)
-        }
-        let age = now - last
-        let hz = measuredHz(s, e)
-        if age > expected * 10 { return .dark(reason: "no sample for \(Fmt.secs(age))") }
-        if age > expected * 2  { return .stale(age: age) }
-        return .live(hz: hz ?? 0, jitter: jitter(s, e) ?? 0)
+                  policy: FreshnessPolicy,
+                  exists: Bool = true,
+                  absentReason: String? = nil,
+                  valueChangedAt: Instant? = nil) -> Liveness {
+        let st = states[Self.key(s, e)]
+        return Freshness.judge(
+            FreshnessInput(now: now,
+                           lastOKAt: st?.lastAt,
+                           lastValueChangedAt: valueChangedAt,
+                           consecutiveFailures: st?.consecutiveFailures ?? 0,
+                           lastOutcome: st?.lastOutcome,
+                           measuredHz: measuredHz(s, e),
+                           jitter: jitter(s, e),
+                           exists: exists,
+                           absentReason: absentReason),
+            policy: policy)
     }
 
     func measuredHz(_ s: SourceKind, _ e: EngineID?) -> Double? {
@@ -106,5 +100,51 @@ final class SourceTracker {
 
     func lastOutcome(_ s: SourceKind, _ e: EngineID?) -> Outcome? {
         states[Self.key(s, e)]?.lastOutcome
+    }
+
+    // MARK: - Value-change cadence, which is NOT the poll cadence
+
+    /// Observed refresh intervals of a slow-changing VALUE, tracked separately
+    /// from the poll intervals above.
+    ///
+    /// Power is the motivating case: we poll at 0.2 Hz but the value moves on
+    /// AppleSmartBattery's own ~4 s schedule, and the only honest bound on "how
+    /// long is too long" is how long this source has actually been observed to
+    /// take. The previous hardcoded 30 s was a guess in both directions.
+    private var valueChanges: [String: (last: Instant, gaps: [Double])] = [:]
+
+    /// Call with the source's own "last changed" timestamp. Repeat calls with
+    /// an unchanged timestamp are ignored, which is what makes this a record of
+    /// changes rather than of polls.
+    func noteValueChange(_ s: SourceKind, _ e: EngineID?, changedAt: Instant) {
+        let k = Self.key(s, e)
+        guard var rec = valueChanges[k] else {
+            valueChanges[k] = (last: changedAt, gaps: [])
+            return
+        }
+        guard changedAt != rec.last else { return }
+        let gap = changedAt - rec.last
+        if gap > 0, gap < 300 {
+            rec.gaps.append(gap)
+            if rec.gaps.count > 24 { rec.gaps.removeFirst() }
+        }
+        rec.last = changedAt
+        valueChanges[k] = rec
+    }
+
+    /// How long this value may sit unchanged before the silence is itself
+    /// suspicious. nil until there is enough history to say anything, in which
+    /// case the caller must supply its own documented default.
+    func valueRefreshBound(_ s: SourceKind, _ e: EngineID?) -> Double? {
+        guard let gaps = valueChanges[Self.key(s, e)]?.gaps, gaps.count > 2,
+              let longest = gaps.max(), longest > 0 else { return nil }
+        // 3x the longest gap actually seen. The question is "is this longer
+        // than this source has ever taken?", not "longer than average" — a mean
+        // would flag every ordinary slow tick.
+        return longest * 3
+    }
+
+    func valueRefreshGaps(_ s: SourceKind, _ e: EngineID?) -> [Double] {
+        valueChanges[Self.key(s, e)]?.gaps ?? []
     }
 }

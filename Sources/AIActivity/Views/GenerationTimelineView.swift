@@ -147,7 +147,12 @@ struct GenerationTimelineView: View {
         if let e = hub.currentEpisode {
             return "\(e.backend) running \(String(format: "%.0f", hub.now - e.start))s"
         }
-        return hub.episodes.isEmpty ? "no generations yet" : "idle"
+        if !hub.episodes.isEmpty { return "idle" }
+        if let p = hub.unenvelopedPrediction {
+            let d = p.totalSeconds.map { String(format: "%.1f s", $0) } ?? "brief"
+            return "last prediction (\(d)) fell between roster polls — no envelope captured"
+        }
+        return "no generations yet"
     }
 
     private var memoryTrailing: String {
@@ -167,7 +172,8 @@ struct GenerationTimelineView: View {
         return [
             SampleRug.Row(id: "sys", label: "sys",
                           times: hub.sysTimes,
-                          liveness: hub.sources.liveness(.system, nil, now: now, expected: 0.5),
+                          liveness: hub.sources.liveness(.system, nil, now: now,
+                                                         policy: .polled(expected: 0.5)),
                           hz: hub.sources.measuredHz(.system, nil)),
             SampleRug.Row(id: "inf", label: "inf",
                           times: hub.rateSeries.times,
@@ -175,7 +181,14 @@ struct GenerationTimelineView: View {
                           hz: hub.sources.measuredHz(.slots, hub.workingRuntime?.engine)),
             SampleRug.Row(id: "pwr", label: "pwr",
                           times: hub.wattSeries.times,
-                          liveness: hub.sources.liveness(.power, nil, now: now, expected: 5),
+                          liveness: hub.sources.liveness(
+                              .power, nil, now: now,
+                              policy: .heldValue(
+                                  pollExpected: 5,
+                                  refreshBound: hub.sources.valueRefreshBound(.power, nil) ?? 30),
+                              exists: hub.latestPower != nil,
+                              absentReason: "no power sample yet",
+                              valueChangedAt: hub.latestPower?.lastRefreshedAt),
                           hz: hub.sources.measuredHz(.power, nil)),
         ]
     }

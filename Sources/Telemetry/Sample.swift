@@ -2,17 +2,30 @@ import Foundation
 
 // MARK: - Time
 
-/// Monotonic seconds since process start.
+/// Monotonic seconds since the first reading was taken.
 ///
 /// Deliberately NOT `Date`: a wall-clock adjustment mid-session must not warp
 /// the timeline. Everything on the shared x-axis is expressed in these.
+///
+/// The origin is FIRST USE, not process start — `epoch` is a lazy static — so a
+/// tool that only starts reading the clock late will see its own timeline begin
+/// near zero. That is harmless for a shared relative axis, which is all this is
+/// used for, but it is not the same claim as "since launch".
 public struct Instant: Sendable, Hashable, Comparable, CustomStringConvertible {
     public var s: Double
     public init(_ s: Double) { self.s = s }
 
     private static let epoch = DispatchTime.now().uptimeNanoseconds
     public static func now() -> Instant {
-        Instant(Double(DispatchTime.now().uptimeNanoseconds &- epoch) / 1_000_000_000)
+        // MEASURED: `epoch` is a LAZY static, and when it appeared as the right
+        // operand Swift sampled the clock first and only then ran the
+        // initialiser — so the epoch was established AFTER the reading it was
+        // meant to precede, and the very first Instant.now() in any process
+        // underflowed the unsigned subtraction to ~1.844e10 s. Every consumer of
+        // that first timestamp inherited it, including TelemetryHub.startedAt.
+        // Binding it first forces the epoch to exist before the clock is read.
+        let base = epoch
+        return Instant(Double(DispatchTime.now().uptimeNanoseconds &- base) / 1_000_000_000)
     }
 
     public static func < (a: Instant, b: Instant) -> Bool { a.s < b.s }
@@ -45,6 +58,11 @@ public enum SourceKind: String, Sendable, Hashable, CaseIterable {
     case slots       // llama-server /slots, ~1-2 Hz, serialized behind decode
     case power       // AppleSmartBattery, ~0.25 Hz (underlying refresh is ~4 s)
     case roster      // engine discovery + /props + /api/ps, ~0.2 Hz
+    /// LM Studio's diagnostics stream. PUSH, not poll: one event at the end of
+    /// each prediction and nothing in between, so its silence means "no work",
+    /// not "no data". Kept separate from .slots, which carries a live-rate
+    /// contract this source cannot honour.
+    case predictions
 }
 
 /// Identifies a specific *run* of a server process.
@@ -74,6 +92,7 @@ public enum Sample: Sendable {
     case inference(InferenceSample)
     case power(PowerSample)
     case roster(EngineRoster)
+    case prediction(PredictionSample)
     case health(SourceHealth)
 }
 
@@ -371,6 +390,91 @@ public struct InferenceSample: Sendable {
     }
 }
 
+// MARK: - Prediction receipts (push, one per completed generation)
+
+/// A completed prediction, as the engine itself reports it.
+///
+/// This is a RETROSPECTIVE RECEIPT, not a live reading, and the distinction is
+/// load-bearing. LM Studio's diagnostics channel emits exactly one object at
+/// the END of a prediction — correlated to the `generating -> processingPrompt`
+/// transition — and nothing during decode. So these numbers are exact for a
+/// generation that is already over, and say nothing whatsoever about one in
+/// progress. Rendering them in a live lane would be a category error, and
+/// deriving a rate from them would be worse: a single end-of-prediction summary
+/// carries no history, so it must never be fed to `SlotStateMachine`, whose
+/// every derivation needs two observations of a growing counter.
+///
+/// This is also the reason the MLX blind spot is only half-closed. Per-
+/// PREDICTION telemetry now exists; per-TOKEN telemetry still does not, and no
+/// amount of interpolation would make it.
+///
+/// Carries NO prompt or completion text, by construction. The underlying
+/// stream includes both, in plaintext, for every client on the machine; this
+/// type is the boundary at which they are dropped and never reconstructed — the
+/// same discipline `APIKey` applies to secrets.
+public struct PredictionSample: Sendable {
+    /// When the receipt was PARSED. The prediction it describes ended slightly
+    /// earlier; `totalSeconds` bounds how much earlier it began.
+    public var t: Instant
+    public var engine: EngineID
+    /// The engine's own model id, e.g. "qwen/qwen3.8-27b". Not a client id:
+    /// the stream is instance-wide and carries no caller identity at all, so a
+    /// prediction driven by another process is indistinguishable from ours.
+    public var modelIdentifier: String
+    /// Why generation stopped: eosFound, maxPredictedTokensReached,
+    /// contextLengthReached, userStopped, ... Only non-optional field in the
+    /// engine's own schema.
+    public var stopReason: String
+
+    /// Engine-reported throughput for the whole prediction. Exact, but an
+    /// average over the generation — not comparable to an instantaneous rate.
+    public var tokensPerSecond: Estimate<Double>
+    /// A POINT, not an `Interval`. Everywhere else in this app TTFT is bounded
+    /// because we are not the client and can only bracket it by the poll
+    /// interval; here the engine WAS the client, so this is the first exact
+    /// time-to-first-token the app has ever had.
+    public var timeToFirstToken: Estimate<Double>
+    /// Speculative accept rate: accepted / total drafted. Unavailable unless a
+    /// draft model was actually in use — the counters are absent otherwise, and
+    /// absent is not zero.
+    public var draftAccepted: Estimate<Double>
+
+    public var totalSeconds: Double?
+    public var promptTokens: Int?
+    public var predictedTokens: Int?
+    public var totalTokens: Int?
+    /// The draft model, when speculative decoding ran.
+    public var draftModel: String?
+
+    /// Which command produced this, so the UI can name its provenance rather
+    /// than presenting an engine-reported number as its own measurement.
+    public var source: String
+
+    public init(t: Instant, engine: EngineID, modelIdentifier: String,
+                stopReason: String,
+                tokensPerSecond: Estimate<Double>,
+                timeToFirstToken: Estimate<Double>,
+                draftAccepted: Estimate<Double>,
+                totalSeconds: Double? = nil,
+                promptTokens: Int? = nil,
+                predictedTokens: Int? = nil,
+                totalTokens: Int? = nil,
+                draftModel: String? = nil,
+                source: String) {
+        self.t = t; self.engine = engine; self.modelIdentifier = modelIdentifier
+        self.stopReason = stopReason
+        self.tokensPerSecond = tokensPerSecond
+        self.timeToFirstToken = timeToFirstToken
+        self.draftAccepted = draftAccepted
+        self.totalSeconds = totalSeconds
+        self.promptTokens = promptTokens
+        self.predictedTokens = predictedTokens
+        self.totalTokens = totalTokens
+        self.draftModel = draftModel
+        self.source = source
+    }
+}
+
 // MARK: - Roster (~0.2 Hz)
 
 public struct RuntimeInfo: Sendable, Identifiable {
@@ -384,6 +488,9 @@ public struct RuntimeInfo: Sendable, Identifiable {
     /// True when this runtime provides no /slots-equivalent, so the inference
     /// domain must report unavailable rather than idle.
     public var exposesTokenTelemetry: Bool = true
+    /// WHY there is no per-token channel, when we can say. A gap named is a
+    /// fact; a gap left blank renders as a fault. Shown verbatim.
+    public var telemetryGap: String?
     public var generation: EndpointGeneration?
     public var endpoint: String            // "127.0.0.1:56388" — never the key
     public var modelName: String?
@@ -404,6 +511,7 @@ public struct RuntimeInfo: Sendable, Identifiable {
 
     public init(engine: EngineID, backend: String? = nil, busy: Bool = false,
                 exposesTokenTelemetry: Bool = true,
+                telemetryGap: String? = nil,
                 generation: EndpointGeneration? = nil,
                 endpoint: String, modelName: String? = nil, quantization: String? = nil,
                 paramCount: Int64? = nil, fileBytes: UInt64? = nil,
@@ -414,6 +522,7 @@ public struct RuntimeInfo: Sendable, Identifiable {
                 requestsPerMinute: Double? = nil) {
         self.engine = engine; self.backend = backend; self.busy = busy
         self.exposesTokenTelemetry = exposesTokenTelemetry
+        self.telemetryGap = telemetryGap
         self.generation = generation; self.endpoint = endpoint
         self.modelName = modelName; self.quantization = quantization
         self.paramCount = paramCount; self.fileBytes = fileBytes

@@ -131,9 +131,42 @@ public final class MockFeed: TelemetryFeed, @unchecked Sendable {
                         RuntimeInfo(engine: .ollama, endpoint: "127.0.0.1:11434",
                                     modelName: "nomic-embed-text", reachable: true,
                                     residentBytes: 0),
+                        // The embedded MLX backend: resident and working, with no
+                        // per-token channel. Exercises the absent-with-a-reason
+                        // path that used to render as a red error.
+                        RuntimeInfo(engine: .bionic, backend: "MLX (embedded)",
+                                    busy: generating,
+                                    exposesTokenTelemetry: false,
+                                    telemetryGap: "no per-token telemetry — per-prediction stats only, via lms log stream",
+                                    endpoint: "Bionic IPC (no HTTP port)",
+                                    modelName: "qwen/qwen3.8-27b",
+                                    quantization: "4bit",
+                                    nCtxFitted: 208_384,
+                                    reachable: true,
+                                    residentBytes: 16_081_678_492),
                     ])))
                 }
 
+                // A retrospective receipt, at the END of a generation — the only
+                // shape this source ever has. Values are a real capture from
+                // qwen/qwen3.8-27b on the embedded MLX engine.
+                if i % 200 == 0, i > 0 {
+                    cont.yield(.prediction(PredictionSample(
+                        t: t, engine: .bionic,
+                        modelIdentifier: "qwen/qwen3.8-27b",
+                        stopReason: "maxPredictedTokensReached",
+                        tokensPerSecond: .high(10.64),
+                        timeToFirstToken: .high(53.111),
+                        draftAccepted: .unavailable("no draft model in use — speculative counters absent"),
+                        totalSeconds: 65.0,
+                        promptTokens: 4063,
+                        predictedTokens: 127,
+                        totalTokens: 4190,
+                        source: "lms log stream --stats")))
+                    cont.yield(.health(SourceHealth(source: .predictions, engine: .bionic,
+                                                    t: t, outcome: .ok, latency: 0,
+                                                    sincePreviousOK: 20)))
+                }
                 i += 1
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }

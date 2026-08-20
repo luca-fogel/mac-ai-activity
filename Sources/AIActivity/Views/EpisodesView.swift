@@ -28,9 +28,17 @@ struct EpisodesView: View {
                     Hairline()
                 }
                 if hub.episodes.isEmpty && hub.currentEpisode == nil {
-                    Text("Send a prompt to either backend and it will appear here.")
-                        .font(T.body).foregroundStyle(T.inkDisabled)
-                        .padding(.vertical, 10)
+                    // Two different situations, and they must not share a label.
+                    if let p = hub.unenvelopedPrediction {
+                        Text(unenvelopedNote(p))
+                            .font(T.body).foregroundStyle(T.inkMuted)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.vertical, 10)
+                    } else {
+                        Text("Send a prompt to either backend and it will appear here.")
+                            .font(T.body).foregroundStyle(T.inkDisabled)
+                            .padding(.vertical, 10)
+                    }
                 }
             }
         }
@@ -46,6 +54,10 @@ struct EpisodesView: View {
             Text("ENERGY").frame(width: 76, alignment: .trailing)
             Text("TOKENS").frame(width: 62, alignment: .trailing)
             Text("J / TOKEN").frame(width: 78, alignment: .trailing)
+            // Labelled "reported" throughout: these come from the engine, not
+            // from this app's sampling, and the distinction is the point.
+            Text("REPORTED TOK/S").frame(width: 74, alignment: .trailing)
+            Text("REPORTED TTFT").frame(width: 66, alignment: .trailing)
         }
         .font(.system(size: 10, weight: .medium)).kerning(0.5)
         .foregroundStyle(T.inkMuted)
@@ -72,10 +84,35 @@ struct EpisodesView: View {
             mono(Fmt.pct(e.peakGPU), 74)
             mono(e.energy.value.map { String(format: "%.0f J", $0) } ?? Fmt.dash, 76)
             mono(e.tokens.map(String.init) ?? Fmt.dash, 62)
+                .help(e.reportedBy.map { "token count reported by the engine via \($0)" }
+                      ?? "from the slot counters")
             mono(e.joulesPerToken.value.map { String(format: "%.1f", $0) } ?? Fmt.dash, 78)
                 .help(e.joulesPerToken.confidence.reason ?? "integrated power ÷ tokens")
+            // The engine's own average, kept in its own column so it can never
+            // be mistaken for the sampled rate. Exact, and only knowable after
+            // the generation ended — which is why MLX has this and no live rate.
+            mono(e.reportedTokensPerSecond.map { String(format: "%.1f", $0) } ?? Fmt.dash, 74)
+                .help(e.reportedBy.map { "average over the whole prediction, reported by the engine via \($0)" }
+                      ?? "no engine-reported rate for this generation")
+            mono(e.reportedTTFT.map { String(format: "%.2f s", $0) } ?? Fmt.dash, 66)
+                .help(e.reportedTTFT == nil
+                      ? "no engine-reported TTFT"
+                      : "exact: the engine was the client, so this is not a bounded interval")
         }
         .padding(.vertical, 7)
+    }
+
+    /// Says what happened AND why there is no row for it, rather than implying
+    /// nothing ran.
+    private func unenvelopedNote(_ p: PredictionSample) -> String {
+        let d = p.totalSeconds.map { String(format: "%.1f s", $0) } ?? "under a second"
+        let tok = p.predictedTokens.map { "\($0) tokens" } ?? "an unknown number of tokens"
+        return """
+        \(p.modelIdentifier) completed a prediction (\(tok) in \(d)), reported by the engine. \
+        It finished between two roster polls, which happen every 5 s, so no GPU or power \
+        envelope was captured for it — energy per token needs an interval this app actually \
+        observed, and inventing one would be worse than leaving it out.
+        """
     }
 
     private func mono(_ s: String, _ w: CGFloat) -> some View {

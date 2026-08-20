@@ -29,7 +29,34 @@ public final class MLXLogTailer: @unchecked Sendable {
     public static let defaultPath = (
         "~/.local/state/mlx-lm/server.log" as NSString).expandingTildeInPath
 
-    private let path: String
+    /// The LaunchAgent path, in preference order after the canonical one.
+    ///
+    /// `tools/mlx-serve.sh` writes the canonical log, but a supervised
+    /// `mlx_lm.server` (com.foggylulu.mlx-model) writes its stderr here instead.
+    /// VERIFIED: same Python `logging` format, and on this machine it was the
+    /// NEWER of the two — so preferring the canonical path blindly would tail a
+    /// stale file while a live one sat next to it.
+    public static let fallbackPaths: [String] = [(
+        "~/.local/state/ai-server/mlx-model.err" as NSString).expandingTildeInPath]
+
+    public static var candidatePaths: [String] { [defaultPath] + fallbackPaths }
+
+    /// The first candidate that exists, preferring whichever was written most
+    /// recently when several do. nil means the channel does not exist at all,
+    /// which the caller must report rather than render as silence.
+    public static func bestAvailablePath() -> String? {
+        let fm = FileManager.default
+        let present = candidatePaths.filter { fm.fileExists(atPath: $0) }
+        guard !present.isEmpty else { return nil }
+        func modified(_ p: String) -> Date {
+            (try? fm.attributesOfItem(atPath: p)[.modificationDate] as? Date) as? Date
+                ?? .distantPast
+        }
+        return present.max { modified($0) < modified($1) }
+    }
+
+    /// Which file this tailer is actually reading, so the UI can name it.
+    public let path: String
     private var offset: UInt64 = 0
     private var carry = ""
     private var state = State()

@@ -35,6 +35,10 @@ final class TelemetryHub {
         var inference: [EngineID: InferenceSample] = [:]
         var power: PowerSample?
         var roster: [RuntimeInfo] = []
+        /// The most recent engine-reported receipt, per engine. Retrospective:
+        /// it describes a generation that has ALREADY FINISHED and must never be
+        /// rendered where a live reading goes.
+        var lastPrediction: [EngineID: PredictionSample] = [:]
         var revision: Int = 0
         var slotPollCount = 0
         var slotServerMillis: Double = 0
@@ -51,6 +55,11 @@ final class TelemetryHub {
     }
     var inferenceByEngine: [EngineID: InferenceSample] { snapshot.inference }
     var latestPower: PowerSample? { snapshot.power }
+    /// Newest receipt from any engine. Newest-first, and always about the past.
+    var lastPrediction: PredictionSample? {
+        snapshot.lastPrediction.values.max { $0.t < $1.t }
+    }
+    func lastPrediction(_ e: EngineID) -> PredictionSample? { snapshot.lastPrediction[e] }
     var revision: Int { snapshot.revision }
     var slotPollCount: Int { snapshot.slotPollCount }
     var slotServerMillis: Double { snapshot.slotServerMillis }
@@ -163,8 +172,26 @@ final class TelemetryHub {
             wattSeries.append(t: v.t.s, v.watts.value)
             pending.power = v
             tracker.noteWatts(v.watts.value, at: v.t)
+            // A true integral, alongside the trapezoidal one, until the raw
+            // units have been calibrated. See Episode.energyUnitRatio.
+            tracker.noteAccumulatedEnergy(v.accumulatedEnergy, at: v.t)
+            // The battery controller's refresh cadence, which is not ours.
+            sources.noteValueChange(.power, nil, changedAt: v.lastRefreshedAt)
         case .roster(let v):
             pending.roster = v.runtimes
+        case .prediction(let v):
+            pending.lastPrediction[v.engine] = v
+            // The receipt is what finally gives an MLX episode a token count.
+            // It may arrive just after the episode closed, which noteReceipt
+            // handles; an unattributable one is dropped, not invented.
+            tracker.noteReceipt(tokens: v.predictedTokens,
+                                tokensPerSecond: v.tokensPerSecond.value,
+                                ttft: v.timeToFirstToken.value,
+                                stopReason: v.stopReason,
+                                reportedBy: v.source,
+                                at: v.t)
+            episodes = tracker.completed
+            currentEpisode = tracker.current
         case .health(let h):
             sources.ingest(h)
         }
@@ -229,8 +256,33 @@ final class TelemetryHub {
         guard !engines.isEmpty else {
             return .absent("no inference server running")
         }
-        let target = workingRuntime?.engine ?? engines[0].engine
-        return sources.liveness(.slots, target, now: now, expected: 1.0)
+        let runtime = workingRuntime ?? engines[0]
+        // A runtime with no /slots-equivalent will never report into this
+        // domain, so waiting for it is not a fault. This is the case that put a
+        // red "no samples yet" chip next to a visibly healthy MLX generation:
+        // the collector was fine, the channel simply does not exist.
+        guard runtime.exposesTokenTelemetry else {
+            return .absent(runtime.telemetryGap ?? "no per-token telemetry")
+        }
+        return sources.liveness(.slots, runtime.engine, now: now,
+                                policy: .polled(expected: 1.0))
+    }
+
+    /// A prediction completed, but no episode was ever opened for it.
+    ///
+    /// Busy/idle is observed on the roster's 0.2 Hz clock, so a generation
+    /// shorter than one poll passes entirely between two observations. The
+    /// receipt proves it happened; there is simply no GPU or power trace to
+    /// draw for it. MEASURED: a 131-token MLX generation finished in ~2.2 s
+    /// against a 5 s roster interval, and the phase panel went on reporting
+    /// "no generations yet" while its receipt was on screen.
+    ///
+    /// A receipt must not manufacture an episode — the stream is instance-wide
+    /// with no caller identity, and an envelope with no trace behind it would be
+    /// a fabrication. So the app says which of the two situations it is in.
+    var unenvelopedPrediction: PredictionSample? {
+        guard episodes.isEmpty, currentEpisode == nil else { return nil }
+        return lastPrediction
     }
 
     /// Engines holding a model right now. Surfaced because showing ONE model in
@@ -293,7 +345,16 @@ final class TelemetryHub {
         guard let w = p.watts.value else {
             return .unavailable(p.watts.confidence.reason ?? "power unavailable")
         }
-        guard let slot = activeSlot else { return .unavailable("not generating") }
+        guard let slot = activeSlot else {
+            // "not generating" was a lie whenever MLX was the engine: it IS
+            // generating, and the app can see that. The honest answer names the
+            // structural gap, and points at the figure that IS available.
+            if let r = busyOpaqueRuntime {
+                return .unavailable(
+                    "\(r.backend ?? "this backend") reports stats only at the end of a prediction — no live rate exists")
+            }
+            return .unavailable("not generating")
+        }
         guard let rate = slot.decodeTokensPerSecond.value, rate > 0.01 else {
             return .unavailable(slot.decodeTokensPerSecond.confidence.reason ?? "no decode rate")
         }

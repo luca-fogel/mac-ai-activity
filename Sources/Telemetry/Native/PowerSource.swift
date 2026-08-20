@@ -53,12 +53,8 @@ public final class PowerSource: @unchecked Sendable {
         }
 
         let mV      = (dict["Voltage"] as? NSNumber)?.doubleValue
-        let mA      = (dict["InstantAmperage"] as? NSNumber).map { n -> Double in
-            // The key is published as an unsigned 64-bit value; discharge is
-            // negative and wraps. Reinterpret rather than reading 1.8e19.
-            let u = n.uint64Value
-            return u > (UInt64.max / 2) ? -Double(UInt64.max - u + 1) : Double(u)
-        }
+        let mA      = (dict["InstantAmperage"] as? NSNumber)
+            .map { Self.signedFromUnsigned($0.uint64Value) }
         let onAC    = (dict["ExternalConnected"] as? Bool) ?? false
 
         // PowerTelemetryData.SystemLoad is a SIGNED net power figure in mW,
@@ -68,10 +64,8 @@ public final class PowerSource: @unchecked Sendable {
         // system load. So it is only usable when positive and plausible --
         // treating it as draw on AC was wrong and produced a 1.8e16 W reading.
         let telem = dict["PowerTelemetryData"] as? [String: Any]
-        let systemLoadmW = (telem?["SystemLoad"] as? NSNumber).map { n -> Double in
-            let u = n.uint64Value
-            return u > (UInt64.max / 2) ? -Double(UInt64.max - u + 1) : Double(u)
-        }
+        let systemLoadmW = (telem?["SystemLoad"] as? NSNumber)
+            .map { Self.signedFromUnsigned($0.uint64Value) }
         let isCharging = (dict["IsCharging"] as? Bool) ?? false
         let accEnergy = (telem?["AccumulatedSystemEnergyConsumed"] as? NSNumber)?.uint64Value
         let cur     = (dict["CurrentCapacity"] as? NSNumber)?.doubleValue
@@ -82,21 +76,11 @@ public final class PowerSource: @unchecked Sendable {
         let sig = "\(mV ?? -1)|\(mA ?? 0)|\(cur ?? -1)|\(systemLoadmW ?? -1)|\(accEnergy ?? 0)"
         if sig != lastSignature { lastSignature = sig; lastChange = Instant.now() }
 
-        let watts: Estimate<Double>
-        var source: String?
-        if let mw = systemLoadmW, mw > 0, mw < 200_000 {
-            watts = .high(mw / 1000)
-            source = "PowerTelemetryData.SystemLoad"
-        } else if isCharging {
-            watts = .unavailable("charging — SystemLoad reports net battery flow, not system draw")
-        } else if !onAC, let v = mV, let a = mA, a < 0 {
-            watts = .high(v * -a / 1_000_000)
-            source = "Voltage x InstantAmperage"
-        } else if onAC {
-            watts = .unavailable("on AC and SystemLoad unavailable — battery amperage reflects charging, not load")
-        } else {
-            watts = .unavailable("AppleSmartBattery reported no usable power telemetry")
-        }
+        let (watts, source) = Self.deriveWatts(systemLoadmW: systemLoadmW,
+                                               milliVolts: mV,
+                                               milliAmps: mA,
+                                               onAC: onAC,
+                                               isCharging: isCharging)
 
         return Stats(
             watts: watts,
@@ -106,6 +90,47 @@ public final class PowerSource: @unchecked Sendable {
             lastChangedAt: lastChange,
             accumulatedEnergy: accEnergy,
             source: source)
+    }
+
+    /// Reinterprets an IOKit value that is SIGNED but published as unsigned.
+    ///
+    /// Both `InstantAmperage` and `PowerTelemetryData.SystemLoad` do this.
+    /// Reading them naively yields 1.8e19 instead of a small negative number,
+    /// which is how a 1.8e16 W reading once reached the screen. Extracted from
+    /// `sample()` so the boundary behaviour is testable without IOKit.
+    static func signedFromUnsigned(_ u: UInt64) -> Double {
+        // The midpoint split is the two's-complement sign bit. `UInt64.max - u`
+        // cannot overflow inside this branch, and the `+ 1` is safe because
+        // u == 0 is excluded by the comparison.
+        u > (UInt64.max / 2) ? -Double(UInt64.max - u + 1) : Double(u)
+    }
+
+    /// The four-way cascade, pure so every branch can be exercised.
+    ///
+    /// Order matters and is not arbitrary: SystemLoad is preferred when it is
+    /// positive and plausible, charging is checked BEFORE V x I because on a
+    /// charging machine neither figure means system draw, and the two remaining
+    /// branches exist to give a specific reason rather than a shared one.
+    static func deriveWatts(systemLoadmW: Double?,
+                            milliVolts: Double?,
+                            milliAmps: Double?,
+                            onAC: Bool,
+                            isCharging: Bool) -> (Estimate<Double>, String?) {
+        // 200 W ceiling: a plausibility bound, not a spec. It exists because a
+        // misread of this key produced 1.8e16 W.
+        if let mw = systemLoadmW, mw > 0, mw < 200_000 {
+            return (.high(mw / 1000), "PowerTelemetryData.SystemLoad")
+        }
+        if isCharging {
+            return (.unavailable("charging — SystemLoad reports net battery flow, not system draw"), nil)
+        }
+        if !onAC, let v = milliVolts, let a = milliAmps, a < 0 {
+            return (.high(v * -a / 1_000_000), "Voltage x InstantAmperage")
+        }
+        if onAC {
+            return (.unavailable("on AC and SystemLoad unavailable — battery amperage reflects charging, not load"), nil)
+        }
+        return (.unavailable("AppleSmartBattery reported no usable power telemetry"), nil)
     }
 
     /// Cheaper and more authoritative than parsing the battery dict for AC.

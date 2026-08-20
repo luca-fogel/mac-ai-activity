@@ -158,20 +158,38 @@ struct StatusRail: View {
         let now = hub.now
         return HStack(spacing: 12) {
             LivenessChip(name: "sys",
-                         liveness: hub.sources.liveness(.system, nil, now: now, expected: 0.5))
+                         liveness: hub.sources.liveness(.system, nil, now: now,
+                                                        policy: .polled(expected: 0.5)))
             LivenessChip(name: "inf", liveness: hub.inferenceLiveness)
             LivenessChip(name: "pwr", liveness: powerLiveness)
         }
     }
 
-    /// Power gets the `held` state: the value is real, but AppleSmartBattery
-    /// refreshes only every few seconds, so drawing it as continuously
-    /// measured would be a fabrication.
+    /// Power has two clocks, and conflating them was the bug.
+    ///
+    /// Our poll succeeds every 5 s, while AppleSmartBattery's values
+    /// legitimately sit unchanged for far longer. Measuring the VALUE's age
+    /// against the POLL's schedule produced a warning-coloured
+    /// "pwr stale 44.5s" on a perfectly healthy collector. Held is the normal
+    /// state here; stale means the value stopped moving for longer than this
+    /// source has ever been observed to take.
     private var powerLiveness: Liveness {
-        guard let p = hub.latestPower else { return .dark(reason: "no sample") }
-        let age = hub.now - p.lastRefreshedAt
-        if age > 30 { return .stale(age: age) }
-        return .held(age: age)
+        let p = hub.latestPower
+        // On AC there is no number at all, so there is nothing to be stale
+        // about — the honest report is the reason, not an age.
+        if let p, p.watts.value == nil {
+            return .absent(p.watts.confidence.reason ?? "power unavailable")
+        }
+        // Until the refresh cadence has been measured, 30 s is a documented
+        // default rather than a claim; once measured, the source is held to its
+        // own observed behaviour.
+        let bound = hub.sources.valueRefreshBound(.power, nil) ?? 30
+        return hub.sources.liveness(
+            .power, nil, now: hub.now,
+            policy: .heldValue(pollExpected: 5, refreshBound: bound),
+            exists: p != nil,
+            absentReason: "no power sample yet",
+            valueChangedAt: p?.lastRefreshedAt)
     }
 
     private var observerReceipt: some View {

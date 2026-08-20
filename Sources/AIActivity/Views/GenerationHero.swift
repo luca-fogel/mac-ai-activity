@@ -41,9 +41,55 @@ struct GenerationHero: View {
                                    tint: hub.activeSlot == nil ? T.inkDisabled : T.inkPrimary,
                                    caption: ttftCaption)
                     }
+                    if let p = lastReceipt { receiptRow(p) }
                 }
                 Spacer(minLength: 0)
             }
+        }
+    }
+
+    /// The engine's own receipt for the last COMPLETED prediction.
+    ///
+    /// Shown only when there is no live slot to report, because that is exactly
+    /// when it is the best available answer — and deliberately in a different
+    /// visual register from the live tiles above: dimmer ink, its own heading,
+    /// its provenance spelled out. An average over a finished generation and an
+    /// instantaneous rate are not the same quantity, and must not be able to be
+    /// mistaken for one another at a glance.
+    private var lastReceipt: PredictionSample? {
+        hub.activeSlot == nil ? hub.lastPrediction : nil
+    }
+
+    private func receiptRow(_ p: PredictionSample) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 5) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 8)).foregroundStyle(T.inkMuted)
+                Text("last completed prediction · reported by the engine")
+                    .font(.system(size: 9)).foregroundStyle(T.inkMuted)
+            }
+            HStack(spacing: T.padSection) {
+                receiptField("avg rate", p.tokensPerSecond.value
+                    .map { String(format: "%.1f tok/s", $0) })
+                receiptField("TTFT", p.timeToFirstToken.value
+                    .map { String(format: "%.2f s", $0) })
+                receiptField("predicted", p.predictedTokens.map { "\($0) tok" })
+                receiptField("prompt", p.promptTokens.map { "\($0) tok" })
+                receiptField("stop", p.stopReason)
+            }
+            Text(p.source + (p.draftAccepted.value
+                .map { String(format: " · speculative accept %.0f%%", $0 * 100) } ?? ""))
+                .font(.system(size: 9)).foregroundStyle(T.inkMuted)
+        }
+        .padding(.top, 2)
+    }
+
+    private func receiptField(_ label: String, _ value: String?) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(label).font(.system(size: 8)).foregroundStyle(T.inkMuted)
+            Text(value ?? Fmt.dash)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(value == nil ? T.inkDisabled : T.inkSecondary)
         }
     }
 
@@ -52,7 +98,7 @@ struct GenerationHero: View {
             return "slot \(s.id)" + (s.idTask.map { " · id_task \($0)" } ?? "")
         }
         if let r = hub.busyOpaqueRuntime {
-            return "\(r.backend ?? "MLX") · not instrumented"
+            return "\(r.backend ?? "MLX") · per-prediction only"
         }
         return "idle"
     }

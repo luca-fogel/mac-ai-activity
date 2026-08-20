@@ -64,6 +64,14 @@ tests in `Tests/TelemetryTests`.
   count and confidence. TTFT is published as a bounded interval, never a point.
 - **Confidence maps to ink and decoration, never to hue.** Hue is spent on
   engine identity (chrome only) and phase/status (plot areas only).
+- **Five source states, not two.** `absent` / `live` / `held` / `stale` / `dark`
+  are rendered as visually incommensurable, and the distinctions are load-bearing:
+  a stopped server is *absent*, not failed; a value whose source refreshes every
+  ~4 s is *held*, not stale; a push stream between events is *absent*, not stale;
+  and a source that has not answered yet is only *dark* once an attempt has
+  actually failed. Judged by one pure function, `Freshness.judge`, against a
+  per-source `FreshnessPolicy` — because these sources differ in kind, not merely
+  in rate.
 - **The observer effect is first-class.** Polling `/slots` occupies the decode
   loop, so the app measures and displays its own cost, and offers a
   minimum-perturbation cadence.
@@ -214,13 +222,70 @@ own rule: reporting a stale identity as if it were live. Fixed by
 - flagging **unattributed activity** — high GPU with no instrumented endpoint to
   account for it — instead of reporting idle.
 
-For MLX we can honestly report residency, size, context and busy/idle, and
-nothing per-token. The Engines view labels it `no per-token telemetry`.
+### Half-closed: per-prediction, but still not per-token
+
+`lms log stream --json --stats` taps LM Studio's own diagnostics channel
+(`client.diagnostics.unstable_streamLogs`) and reports **completed predictions
+for every client of the instance** — GUI, SDK, CLI and the HTTP server alike.
+Verified with the OpenAI-compatible server switched **off**: GUI-driven
+generations still arrive. Captured from the embedded MLX engine:
+
+```
+qwen/qwen3.8-27b [maxPredictedTokensReached]
+  10.64 tok/s avg · TTFT 53.111 s · prompt 4063 · predicted 127
+```
+
+That is an exact, engine-reported receipt, and it is the app's **first exact
+TTFT** — everywhere else TTFT is published as an `Interval` because we are not
+the client and can only bracket it by the poll interval. Here the engine *was*
+the client.
+
+What it is **not** is a live rate. Exactly one object arrives at the END of a
+prediction, correlated to the `generating -> processingPrompt` transition, and
+nothing during decode. So:
+
+- energy-per-token for MLX is now answerable, **retrospectively**;
+- the live decode rate remains structurally unknowable, and is labelled that way
+  rather than interpolated.
+
+A single end-of-prediction summary carries no history, so it must never be fed to
+`SlotStateMachine`, whose every derivation needs two observations of a growing
+counter. It goes to the **episode** layer instead, where `Episode.tokens` was
+already waiting for it.
+
+Three things the integration defends against, all measured rather than assumed:
+
+- **`--filter output` is load-bearing twice over.** It drops
+  `llm.prediction.input` events, which are simultaneously the privacy exposure
+  (the entire rendered prompt — 25k tokens observed) and the only observed source
+  of malformed output: one arrived truncated at exactly 81920 bytes with an
+  unterminated string. Every `output` event seen was under 2.2 KB and parsed
+  cleanly. A whole generation costs **one line**.
+- **The child must not outlive us.** Killing the parent leaves `lms log stream`
+  running indefinitely — with no model loaded it never writes, so it never takes
+  SIGPIPE from the closed pipe, and macOS has no `PR_SET_PDEATHSIG`. An orphan
+  here would hold a live subscription to every prompt on the machine. The child
+  runs under a shell that polls our pid; verified reaped after `kill -9`.
+- **The API is named `unstable_`.** Every field in the stats block is optional in
+  the engine's own schema, and `stats` itself is optional. Absence maps to
+  `.unavailable`, never to zero.
+
+No prompt or completion text ever enters a `Sample`. `PredictionSample` has no
+field that could hold it — the same discipline `APIKey` applies to secrets.
 
 ## Not measurable here
 
 - GPU/ANE wattage — needs root (`powermetrics`). Whole-system watts via
   `AppleSmartBattery` is root-free and is what the app uses.
-- Speculative accept rate — `/slots` exposes the configuration only, and
-  `/metrics` returns 501 because Bionic does not pass `--metrics`.
+- **Live** per-token rate on MLX — one stats object per prediction, nothing during
+  decode. The retrospective average is exact; the instantaneous rate does not
+  exist to be read.
+- Speculative accept rate on llama.cpp — `/slots` exposes the configuration only,
+  and `/metrics` returns 501 because Bionic does not pass `--metrics`. LM Studio
+  *does* report accepted/rejected draft counts per prediction, so it is
+  measurable there whenever a draft model is in use.
 - Power on AC — battery amperage reflects charging current, not load.
+- True energy integration — `AccumulatedSystemEnergyConsumed` is now sampled at
+  episode boundaries, but its units are undocumented, so the app publishes the
+  implied ratio against the trapezoidal figure for calibration rather than
+  asserting joules it cannot justify.

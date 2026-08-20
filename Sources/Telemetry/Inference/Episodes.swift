@@ -27,7 +27,54 @@ public struct Episode: Identifiable, Sendable {
     public var energyJoules: Double = 0
     public var energySamples: Int = 0
 
+    // MARK: Engine-reported figures (end of prediction only)
+
+    /// Exact, from the engine's own stats block — but knowable only once the
+    /// generation is over, and an AVERAGE over it. Kept in separate fields from
+    /// the derived ones on purpose: merging an exact retrospective figure with a
+    /// sampled live one would make it impossible to say which you are looking at.
+    public var reportedTokensPerSecond: Double?
+    /// The one exact TTFT in the app: the engine was the client.
+    public var reportedTTFT: Double?
+    public var reportedStopReason: String?
+    /// Which command vouches for the reported figures.
+    public var reportedBy: String?
+
+    // MARK: True energy integral (raw units — see the doc below)
+
+    /// `AccumulatedSystemEnergyConsumed` at the episode's first and last power
+    /// sample. Differencing these is a TRUE integral over the interval, which
+    /// beats multiplying a value that only refreshes every ~4 s by dt.
+    ///
+    /// Published in RAW UNITS and deliberately not converted: the scale of that
+    /// IOKit key is undocumented, and guessing it would put a confidently wrong
+    /// joule figure on screen. Both this and `energyJoules` are carried until
+    /// they have been calibrated against each other — see
+    /// `telemetry-probe --live`, which prints the implied ratio.
+    public var energyAccumStart: UInt64?
+    public var energyAccumEnd: UInt64?
+    /// The accumulator went backwards inside this episode — a counter reset or
+    /// wraparound — so the interval is not usable. There is no handling for
+    /// this anywhere else, and a negative energy would be worse than none.
+    public var energyAccumInvalid = false
+
     public var duration: Double? { end.map { $0 - start } }
+
+    /// The accumulator's delta in RAW units, or nil when unusable. Not joules.
+    public var accumulatedEnergyDelta: UInt64? {
+        guard !energyAccumInvalid,
+              let a = energyAccumStart, let b = energyAccumEnd, b >= a else { return nil }
+        return b - a
+    }
+
+    /// Raw accumulator units per trapezoidal joule, for calibrating the two
+    /// against each other. Once this is stable across episodes, the accumulator
+    /// can replace the trapezoidal estimate; until then it is evidence, not a
+    /// measurement.
+    public var energyUnitRatio: Double? {
+        guard let d = accumulatedEnergyDelta, energyJoules > 1 else { return nil }
+        return Double(d) / energyJoules
+    }
     public var meanGPU: Double { gpuSamples > 0 ? gpuSum / Double(gpuSamples) : 0 }
 
     public var prefillSeconds: Double? {
@@ -98,6 +145,51 @@ public struct EpisodeTracker: Sendable {
         guard dt > 0, dt < 30 else { return }
         e.energyJoules += (w + pw) / 2 * dt
         e.energySamples += 1
+        episodes[episodes.count - 1] = e
+    }
+
+    /// Attaches an engine-reported receipt to the generation it describes.
+    ///
+    /// The receipt lands at the END of a prediction, and by then the episode may
+    /// already have closed: busy/idle is observed on the roster's 0.2 Hz clock,
+    /// so the boundary can be crossed in either order. Attaching to a
+    /// just-closed episode inside a grace window is therefore correct.
+    ///
+    /// A receipt never CREATES an episode. The stream is instance-wide and
+    /// carries no caller identity, so a prediction driven by some other process
+    /// is indistinguishable from ours — and we would know nothing about its
+    /// envelope. An unattributable receipt is dropped rather than invented into
+    /// an episode with no GPU or power trace behind it.
+    @discardableResult
+    public mutating func noteReceipt(tokens: Int?,
+                                     tokensPerSecond: Double?,
+                                     ttft: Double?,
+                                     stopReason: String,
+                                     reportedBy: String,
+                                     at t: Instant,
+                                     grace: Double = 15) -> Bool {
+        guard let i = episodes.indices.last else { return false }
+        var e = episodes[i]
+        if let end = e.end, t - end > grace { return false }
+        if let n = tokens { e.tokens = max(e.tokens ?? 0, n) }
+        e.reportedTokensPerSecond = tokensPerSecond
+        e.reportedTTFT = ttft
+        e.reportedStopReason = stopReason
+        e.reportedBy = reportedBy
+        episodes[i] = e
+        return true
+    }
+
+    /// Samples the monotonic energy accumulator at the episode's boundaries.
+    public mutating func noteAccumulatedEnergy(_ raw: UInt64?, at t: Instant) {
+        guard let raw, var e = current else { return }
+        if e.energyAccumStart == nil {
+            e.energyAccumStart = raw
+        } else if let last = e.energyAccumEnd ?? e.energyAccumStart, raw < last {
+            // Reset or wraparound: the interval is no longer an integral.
+            e.energyAccumInvalid = true
+        }
+        e.energyAccumEnd = raw
         episodes[episodes.count - 1] = e
     }
 

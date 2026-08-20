@@ -6,6 +6,11 @@ import Telemetry
 // regression test rather than a claim.
 
 func gib(_ b: UInt64) -> String { String(format: "%7.2f GiB", Double(b) / 1_073_741_824) }
+// Line-buffer stdout: this tool is almost always run into a pipe or a file,
+// where libc block-buffers by default and nothing appears until exit — which
+// makes a live telemetry probe useless.
+setvbuf(stdout, nil, _IOLBF, 0)
+
 let args = Set(CommandLine.arguments.dropFirst())
 
 let gpu = GPUAccelerator()
@@ -35,6 +40,38 @@ if args.contains("--cost") {
     exit(0)
 }
 
+// Proves the prediction stream on its own, health included, without the rest
+// of the collector in the way. This is the only source in the app that owns a
+// child process, so it gets its own harness.
+if args.contains("--predictions") {
+    let stream = LMSLogStream()
+    let sem = DispatchSemaphore(value: 0)
+    Task.detached {
+        print("cli        \(LMSLogStream.defaultCLI)")
+        print("available  \(await stream.isAvailable)")
+        print("argv       lms \(LMSLogStream.arguments.joined(separator: " "))")
+        print("waiting for predictions — drive a generation in LM Studio\n")
+        await stream.start()
+        for await e in stream.events {
+            switch e {
+            case .health(let outcome, let t):
+                print("HEALTH \(t)  \(outcome.shortReason)")
+            case .prediction(let p):
+                let tps = p.tokensPerSecond.value.map { String(format: "%.2f tok/s", $0) }
+                    ?? "— (\(p.tokensPerSecond.confidence.reason ?? "?"))"
+                let ttft = p.timeToFirstToken.value.map { String(format: "%.3f s", $0) } ?? "—"
+                print("PRED   \(p.modelIdentifier) [\(p.stopReason)]  \(tps)  TTFT \(ttft)  "
+                      + "prompt \(p.promptTokens.map(String.init) ?? "—") "
+                      + "predicted \(p.predictedTokens.map(String.init) ?? "—")")
+                print("       lines \(await stream.linesSeen)  malformed \(await stream.malformedLines)")
+            }
+        }
+        sem.signal()
+    }
+    sem.wait()
+    exit(0)
+}
+
 if args.contains("--live") {
     let feed = LiveTelemetryFeed()
     let sem = DispatchSemaphore(value: 0)
@@ -43,7 +80,7 @@ if args.contains("--live") {
     // the main thread.
     Task.detached {
         await feed.start()
-        var nSys = 0, nInf = 0
+        var nSys = 0, nInf = 0, nPred = 0
         for await sample in feed.samples {
             switch sample {
             case .system(let s):
@@ -76,6 +113,22 @@ if args.contains("--live") {
             case .power(let p):
                 let w = p.watts.value.map { String(format: "%.2f W", $0) } ?? "— (\(p.watts.confidence.reason ?? "?"))"
                 print(String(format: "PWR  %@   held %.1fs   batt %.0f%%  %.1f C", w, p.t - p.lastRefreshedAt, (p.batteryFraction ?? 0)*100, p.batteryTempC ?? 0))
+            case .prediction(let pr):
+                nPred += 1
+                let tps = pr.tokensPerSecond.value.map { String(format: "%.2f tok/s", $0) }
+                    ?? "— (\(pr.tokensPerSecond.confidence.reason ?? "?"))"
+                let ttft = pr.timeToFirstToken.value.map { String(format: "%.3f s", $0) }
+                    ?? "— (\(pr.timeToFirstToken.confidence.reason ?? "?"))"
+                let spec = pr.draftAccepted.value.map { String(format: "%.1f%%", $0 * 100) }
+                    ?? "— (\(pr.draftAccepted.confidence.reason ?? "?"))"
+                print("PRED \(pr.modelIdentifier)  [\(pr.stopReason)]  via \(pr.source)")
+                print(String(format: "       %@ avg   TTFT %@   prompt %@  predicted %@  total %@ s",
+                             tps, ttft,
+                             pr.promptTokens.map(String.init) ?? "—",
+                             pr.predictedTokens.map(String.init) ?? "—",
+                             pr.totalSeconds.map { String(format: "%.1f", $0) } ?? "—"))
+                print("       speculative accept \(spec)   RETROSPECTIVE — not a live rate")
+
             case .roster(let r):
                 print("ROS  " + r.runtimes.map { "\($0.engine.displayName)@\($0.endpoint)\($0.modelName.map { m in " [\(m)]" } ?? "")" }.joined(separator: "  "))
             case .health(let h):

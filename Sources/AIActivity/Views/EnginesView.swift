@@ -85,8 +85,13 @@ struct EngineRow: View {
                         Text(b).font(.system(size: 9)).foregroundStyle(T.inkMuted)
                     }
                     if !info.exposesTokenTelemetry {
-                        Text("· no per-token telemetry")
-                            .font(.system(size: 9)).foregroundStyle(T.warning)
+                        // A gap NAMED is a fact; a bare warning reads as a
+                        // fault. For embedded MLX the honest statement is
+                        // narrower than it used to be: per-prediction stats do
+                        // exist now, per-token ones still do not.
+                        Text("· " + (info.telemetryGap ?? "no per-token telemetry"))
+                            .font(.system(size: 9)).foregroundStyle(T.inkMuted)
+                            .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                     }
                     if info.busy { Chip(text: "generating", tint: T.good) }
                 }

@@ -1,10 +1,16 @@
 import Foundation
 
-/// The live collector. Three independent streams, deliberately never fused.
+/// The live collector. Four independent streams, deliberately never fused.
 ///
-///   system     native IOKit/mach   2-10 Hz adaptive   ~31 us/tick
-///   inference  llama-server /slots  1 Hz or 0.2 Hz    100-450 ms per call
-///   slow       discovery + power    0.2 Hz
+///   system      native IOKit/mach    2-10 Hz adaptive   ~31 us/tick
+///   inference   llama-server /slots   1 Hz or 0.2 Hz    100-450 ms per call
+///   slow        discovery + power     0.2 Hz
+///   predictions lms diagnostics      PUSH, ~1 per generation
+///
+/// The fourth is the odd one out and is meant to be: it does not poll at all.
+/// LM Studio emits one receipt at the END of each prediction and nothing during
+/// decode, so there is no rate to choose and its silence means "no work", not
+/// "no data". It is the only channel that can see Bionic's embedded MLX engine.
 ///
 /// The rates differ by two orders of magnitude because the sources genuinely
 /// do. Interpolating the slow stream onto the fast grid would fabricate
@@ -18,6 +24,10 @@ public actor LiveTelemetryFeed: TelemetryFeed {
     private let gpu = GPUAccelerator()
     private let power = PowerSource()
     private let registry = EndpointRegistry()
+    /// Its own actor on purpose: it owns a long-lived child process, and
+    /// LMStudioProbe already demonstrates what attaching one of those to this
+    /// actor costs — a ~240 ms stall of every other collector, every 5 s.
+    private let lms = LMSLogStream()
 
     private var machines: [EngineID: SlotStateMachine] = [:]
     private var mlxTailer: MLXLogTailer?
@@ -60,6 +70,7 @@ public actor LiveTelemetryFeed: TelemetryFeed {
             Task { [weak self] in await self?.systemLoop() },
             Task { [weak self] in await self?.slowLoop() },
             Task { [weak self] in await self?.inferenceLoop() },
+            Task { [weak self] in await self?.predictionLoop() },
         ]
     }
 
@@ -67,7 +78,38 @@ public actor LiveTelemetryFeed: TelemetryFeed {
         running = false
         tasks.forEach { $0.cancel() }
         tasks.removeAll()
+        let stream = lms
+        Task { await stream.stop() }
         cont.finish()
+    }
+
+    // MARK: - Stream D: LM Studio diagnostics, PUSH
+
+    /// Awaits receipts rather than polling for them.
+    ///
+    /// This is the only source in the app whose quiet carries no information
+    /// about its health, which is why `.predictions` is judged under
+    /// `FreshnessPolicy.eventDriven` and never reads stale.
+    private func predictionLoop() async {
+        guard await lms.isAvailable else {
+            // No lms CLI. Nothing has failed; there is simply no such channel.
+            emitHealth(.predictions, engine: lms.engine, t: Instant.now(),
+                       outcome: .other("lms CLI not installed"), latency: 0)
+            return
+        }
+        await lms.start()
+        for await event in lms.events {
+            guard running, !Task.isCancelled else { break }
+            switch event {
+            case .prediction(let p):
+                cont.yield(.prediction(p))
+                emitHealth(.predictions, engine: p.engine, t: p.t,
+                           outcome: .ok, latency: 0)
+            case .health(let outcome, let t):
+                emitHealth(.predictions, engine: lms.engine, t: t,
+                           outcome: outcome, latency: 0)
+            }
+        }
     }
 
     // MARK: - Stream A: native, 2-10 Hz
@@ -165,8 +207,12 @@ public actor LiveTelemetryFeed: TelemetryFeed {
             descriptors = Dictionary(uniqueKeysWithValues: runtimes.map { ($0.engine, $0) })
 
             if runtimes.contains(where: { $0.engine == .mlxlm }), mlxTailer == nil {
-                let t = MLXLogTailer()
-                if t.exists { mlxTailer = t }
+                // Prefer whichever candidate log was written most recently: the
+                // canonical path can exist but be stale while a supervised run
+                // writes elsewhere.
+                if let p = MLXLogTailer.bestAvailablePath() {
+                    mlxTailer = MLXLogTailer(path: p)
+                }
             }
             for d in runtimes where clients[d.engine] == nil && d.engine == .bionic {
                 clients[d.engine] = LlamaSlotsClient(
@@ -180,8 +226,9 @@ public actor LiveTelemetryFeed: TelemetryFeed {
             var entries = runtimes.map(rosterEntry)
             for m in LMStudioProbe.snapshot() where m.isMLX {
                 entries.append(RuntimeInfo(
-                    engine: .bionic, backend: "MLX (embedded)", busy: m.isGenerating,
+                    engine: .bionic, backend: "MLX (embedded)", busy: m.isBusy,
                     exposesTokenTelemetry: false,          // no /slots equivalent
+                    telemetryGap: "no per-token telemetry — per-prediction stats only, via lms log stream",
                     endpoint: "Bionic IPC (no HTTP port)",
                     modelName: m.identifier,
                     quantization: m.architecture,
@@ -190,14 +237,30 @@ public actor LiveTelemetryFeed: TelemetryFeed {
                     residentBytes: m.sizeBytes))
             }
             cont.yield(.roster(EngineRoster(t: t, runtimes: entries)))
+            // .roster is a declared source; without this it never reported and
+            // its row in the inspector was permanently red.
+            emitHealth(.roster, engine: nil, t: t, outcome: .ok,
+                       latency: Instant.now() - t)
 
+            // Health is emitted either way: when this was inside the `if let`,
+            // an IOKit failure produced no health sample at all, so the chip
+            // aged into a generic "no samples yet" instead of naming the fault.
             if let p = power.sample() {
+                // MEASURED: this read "held -3.1s" on the first sample. `t` is
+                // stamped at the top of the loop and PowerSource stamps its own
+                // change time during the read, so lastChangedAt can legitimately
+                // be LATER than t. A negative hold age is not a thing; clamp it
+                // here rather than letting every consumer defend itself.
                 cont.yield(.power(PowerSample(
-                    t: t, lastRefreshedAt: p.lastChangedAt, watts: p.watts,
+                    t: t, lastRefreshedAt: min(p.lastChangedAt, t), watts: p.watts,
                     onAC: p.onAC, batteryFraction: p.batteryFraction,
                     batteryTempC: p.batteryTempC,
                     accumulatedEnergy: p.accumulatedEnergy, source: p.source)))
                 emitHealth(.power, engine: nil, t: t, outcome: .ok, latency: 0)
+            } else {
+                emitHealth(.power, engine: nil, t: t,
+                           outcome: .other("AppleSmartBattery properties unreadable"),
+                           latency: 0)
             }
 
             try? await Task.sleep(nanoseconds: 5_000_000_000)
@@ -213,6 +276,11 @@ public actor LiveTelemetryFeed: TelemetryFeed {
             // mlx-lm's telemetry comes from its log; if the log is not where we
             // expect it, say so rather than reporting silence as idle.
             exposesTokenTelemetry: d.engine != .mlxlm || mlxTailer != nil,
+            // Name the missing file AND the remedy. "No telemetry" alone reads
+            // as a fault when the truth is that a log needs enabling.
+            telemetryGap: (d.engine == .mlxlm && mlxTailer == nil)
+                ? "no log at \(MLXLogTailer.candidatePaths.joined(separator: " or ")) — start mlx-lm via tools/mlx-serve.sh to enable its telemetry"
+                : nil,
             generation: d.generation,
             endpoint: "\(d.host):\(d.port)",
             modelName: d.facts.modelName, quantization: d.facts.quantization,

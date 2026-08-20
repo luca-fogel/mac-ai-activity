@@ -50,25 +50,60 @@ struct SourcesInspector: View {
         }
     }
 
+    /// One row per source that could report, derived from the roster rather
+    /// than hardcoded: a fixed "slots · bionic" row showed a permanent error
+    /// whenever llama.cpp was not the engine in use.
     private var sourcesPanel: some View {
         Panel(title: "Sources") {
             VStack(alignment: .leading, spacing: 10) {
-                sourceRow("system", .system, nil, expected: 0.5)
-                sourceRow("slots · bionic", .slots, .bionic, expected: 1.0)
-                sourceRow("power", .power, nil, expected: 5.0)
-                sourceRow("roster", .roster, nil, expected: 5.0)
+                sourceRow("system", .system, nil, policy: .polled(expected: 0.5))
+                ForEach(instrumentableRuntimes, id: \.id) { r in
+                    sourceRow("slots · \(r.engine.rawValue)", .slots, r.engine,
+                              policy: .polled(expected: 1.0),
+                              exists: r.exposesTokenTelemetry,
+                              absentReason: r.telemetryGap)
+                }
+                sourceRow("power", .power, nil,
+                          policy: .heldValue(
+                              pollExpected: 5,
+                              refreshBound: hub.sources.valueRefreshBound(.power, nil) ?? 30),
+                          exists: hub.latestPower != nil,
+                          absentReason: "no power sample yet",
+                          valueChangedAt: hub.latestPower?.lastRefreshedAt)
+                sourceRow("roster", .roster, nil, policy: .polled(expected: 5.0))
+                // Push, so its quiet is idleness rather than a fault. Judged
+                // under eventDriven for exactly that reason.
+                sourceRow("predictions · bionic", .predictions, .bionic,
+                          policy: .eventDriven(quietAfter: 300),
+                          exists: true,
+                          absentReason: "no prediction seen yet")
             }
         }
     }
 
+    private var instrumentableRuntimes: [RuntimeInfo] {
+        let rs = hub.roster.filter { $0.engine != .ollama && $0.engine != .localai }
+        return rs.isEmpty ? [] : rs
+    }
+
     private func sourceRow(_ name: String, _ kind: SourceKind,
-                           _ engine: EngineID?, expected: Double) -> some View {
-        let live = hub.sources.liveness(kind, engine, now: hub.now, expected: expected)
+                           _ engine: EngineID?,
+                           policy: FreshnessPolicy,
+                           exists: Bool = true,
+                           absentReason: String? = nil,
+                           valueChangedAt: Instant? = nil) -> some View {
+        let live = hub.sources.liveness(kind, engine, now: hub.now, policy: policy,
+                                        exists: exists, absentReason: absentReason,
+                                        valueChangedAt: valueChangedAt)
         return VStack(alignment: .leading, spacing: 3) {
             LivenessChip(name: name, liveness: live)
             HStack(spacing: 12) {
                 Text("p50 \(Fmt.secs(hub.sources.latencyP50(kind, engine)))")
                 Text("measured \(Fmt.hz(hub.sources.measuredHz(kind, engine)))")
+                if case .heldValue = policy,
+                   let b = hub.sources.valueRefreshBound(kind, engine) {
+                    Text(String(format: "value refresh \u{2264}%.0fs observed", b / 3))
+                }
             }
             .font(.system(size: 10, design: .monospaced)).foregroundStyle(T.inkMuted)
         }
@@ -78,7 +113,8 @@ struct SourcesInspector: View {
         Panel(title: "Not measurable here") {
             VStack(alignment: .leading, spacing: 6) {
                 bullet("GPU and ANE wattage", "requires root (powermetrics). This app runs unprivileged and does not estimate them.")
-                bullet("Speculative accept rate", "/slots exposes the configuration only; there are no drafted/accepted counters and /metrics is disabled on this server.")
+                bullet("Speculative accept rate on llama.cpp", "/slots exposes the configuration only; there are no drafted/accepted counters and /metrics is disabled on this server. LM Studio DOES report accepted/rejected draft tokens per prediction, so this is measurable there whenever a draft model is in use.")
+                bullet("Live token rate on MLX", "LM Studio emits one stats object at the END of each prediction and nothing during decode, so an exact retrospective figure is available and an instantaneous one does not exist. This app shows the former and refuses to interpolate the latter.")
                 bullet("Allocated context window", "n_ctx reports the model maximum and --fit-ctx is a fit target that the server was observed to exceed.")
                 bullet("Power on AC", "battery amperage reflects charging current, not system load.")
             }
