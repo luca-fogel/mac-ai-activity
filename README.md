@@ -11,6 +11,11 @@ Headline metric: **joules per token** = system watts ÷ emitted tok/s, with the
 idle floor subtracted, so what you see is the marginal energy cost of inference
 rather than the cost of the machine being switched on.
 
+![Timeline view during a live generation](docs/images/timeline.png)
+
+*Jan's 4B model decoding at 50.9 tok/s: 98% GPU against 0.1% backend CPU, 101.8 W,
+93.7 °C, and the number that motivated the whole app — **2.0 joules per token**.*
+
 > Status: works on my machine and is used daily, but it has run on exactly one
 > Mac (M2 Max, macOS Tahoe). Sensor maps and engine quirks are measured, not
 > guessed — see the [engineering notes](docs/ENGINEERING-NOTES.md) — but they
@@ -25,6 +30,44 @@ rather than the cost of the machine being switched on.
 | **Engines** | Which runtime is actually burning resources (hue is earned by residency) |
 | **Cooling** | How hot the die really is, what the fans are doing, and — with the root helper installed — what you want them to do instead |
 | **Sources** (⌘I) | Per-source health, measured rates, the app's own observer cost, and what is *not* measurable |
+
+### Slots
+
+![Slots view](docs/images/slots.png)
+
+Slot 0 has never served a request, so every field is `—` rather than a stale
+number. Slot 1 is decoding: 176 tokens of the **4,096-token window actually
+allocated to it** — Jan is the one engine that pins that number down, so the app
+states it instead of hedging between two denominators — with 98.1% of the prompt
+recalled from cache, and the full sampler chain in force.
+
+### Engines
+
+![Engines view](docs/images/engines.png)
+
+98% GPU against 0.1% CPU, with the reason spelled out rather than reported as a
+fault. Jan's three tiers are separate rows: the router holding no weights, the
+instance actually generating, and a model the router *could* load on demand —
+listed as holding nothing, because asking about it would have loaded it.
+
+### Cooling
+
+![Cooling view](docs/images/cooling.png)
+
+A 103.6 °C hotspot taken as the **maximum** over 67 sensors, not their mean, with
+18 of the 27 P-core sensors excluded as power-gated — they were reading colder
+than the room while the die was at 100 °C. Control is read-only until you
+install the helper, and the panel says so.
+
+### Sources (⌘I)
+
+![Sources inspector](docs/images/sources.png)
+
+The app's own cost, measured and displayed: **31 µs per collector tick, 0.03% of
+one core**, 16 `/slots` polls in the last minute, and 0.2 s of llama-server's
+last 60 s spent answering them. Polling `/slots` steals decode time, so the
+cadence is yours to set, and every source reports its own measured rate and
+state.
 
 ## Requirements
 

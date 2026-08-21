@@ -44,7 +44,8 @@ struct RootView: View {
                 Button { showSources.toggle() } label: {
                     Label("Sources", systemImage: "waveform.path.ecg")
                 }
-                .help("Per-source health, measured rates, and observer cost")
+                .keyboardShortcut("i", modifiers: .command)
+                .help("Per-source health, measured rates, and observer cost (⌘I)")
             }
         }
         .inspector(isPresented: $showSources) {
