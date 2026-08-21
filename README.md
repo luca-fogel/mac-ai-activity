@@ -195,6 +195,14 @@ field that could hold one. Jan's per-launch API key is wrapped in an `APIKey`
 type and is never rendered, logged, or copied into a sample. Nothing is
 persisted to disk and nothing leaves the machine.
 
+## See also
+
+[**llmctl**](https://github.com/foggylulu/llmctl) — the same machine's *memory*
+rather than its inference behaviour: which engines are holding RAM, which idle
+server processes are still pinning weights with `mlock`, and one command to get
+it back. This app answers "what did that generation cost"; that one answers
+"what is holding my RAM".
+
 ## Documentation
 
 - [Engineering notes](docs/ENGINEERING-NOTES.md) — measurement traps, the SMC
