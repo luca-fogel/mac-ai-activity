@@ -55,7 +55,7 @@ PROMPTS = {
 
 def cold_prompt():
     docs = []
-    for p in ["README.md", "../qwen-control-mac/README.md"]:
+    for p in ["README.md", "docs/ENGINEERING-NOTES.md"]:
         try:
             with open(p) as f: docs.append((p, f.read()))
         except OSError: pass

@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 
-/// System memory, using llmctl's hard-won formula.
+/// System memory, using the formula from `llmctl` (an earlier CLI of mine).
 ///
 /// The correction that matters: file-backed page cache is NOT counted as used.
 /// A 20-46 GB GGUF sitting in the page cache is reclaimable, and counting it

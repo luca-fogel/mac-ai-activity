@@ -41,8 +41,8 @@ struct AIActivityApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
-        // .regular, NOT .accessory: unlike QwenMenu and LLMMenu this app is a
-        // window-first tool that must be Spotlight-launchable and Cmd-Tabbable.
+        // .regular, NOT .accessory: despite having a menu bar readout, this is
+        // a window-first tool that must be Spotlight-launchable and Cmd-Tabbable.
         NSApp.setActivationPolicy(.regular)
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { false }

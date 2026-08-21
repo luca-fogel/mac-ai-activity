@@ -1,10 +1,10 @@
 import SwiftUI
 import Telemetry
 
-/// The menu bar is already crowded (QwenMenu and LLMMenu both live there, and
-/// items get squeezed out by front-app menus), and LLMMenu already owns "GB
-/// held". So: a glyph when idle, and tok/s — a number that exists nowhere else
-/// on this Mac — only while generating.
+/// The menu bar is scarce — items get squeezed out silently by front-app menus
+/// — and memory is already covered by Activity Monitor and every menu-bar stats
+/// app. So this readout spends its space on the one number nothing else on the
+/// machine has: a glyph when idle, and tok/s only while generating.
 struct MenuBarLabel: View {
     @Environment(TelemetryHub.self) private var hub
 

@@ -1,11 +1,11 @@
 #!/bin/bash
 # Builds and installs "AI Activity.app".
 #
-# This script is committed on purpose: LLMMenu.app was built ad hoc with nothing
-# in the repo, which made it unreproducible. Adapted from the working pattern in
-# ~/qwen-control-mac/install.sh (lines 129-173), with LSUIElement removed (this
-# app is window-first) and NSAllowsLocalNetworking added (it talks plain HTTP to
-# loopback).
+# This script is committed on purpose. A SwiftPM executable is not a launchable
+# .app, and assembling the bundle by hand once leaves the build unreproducible:
+# the Info.plist keys below are load-bearing (see Resources/Info.plist.in) and
+# the ad-hoc signature is what stops macOS re-prompting for permissions on every
+# rebuild.
 set -euo pipefail
 cd "$(dirname "$0")"
 

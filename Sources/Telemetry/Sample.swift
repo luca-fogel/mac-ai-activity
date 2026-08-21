@@ -146,7 +146,7 @@ public struct SystemSample: Sendable {
     public var gpuAllocBytes: UInt64?
     public var gpuRecoveryCount: Int       // nonzero = driver reset, invalidates windows
 
-    // Memory — llmctl's formula, file-backed cache deliberately excluded.
+    // Memory — see MachMemory: file-backed cache deliberately excluded.
     public var memTotal: UInt64
     public var memUsed: UInt64
     public var memWired: UInt64

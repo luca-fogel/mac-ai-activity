@@ -19,9 +19,9 @@
 	<key>NSSupportsAutomaticTermination</key> <false/>
 	<key>NSSupportsSuddenTermination</key>    <false/>
 
-	<!-- NO LSUIElement KEY. This is the deliberate difference from QwenMenu.app
-	     and LLMMenu.app: this app is window-first and needs a Dock icon,
-	     Cmd-Tab, and Spotlight launchability. -->
+	<!-- NO LSUIElement KEY, deliberately. This app is window-first and needs a
+	     Dock icon, Cmd-Tab, and Spotlight launchability; it has a menu bar
+	     readout, but that is not what it is. -->
 
 	<!-- The app talks plain HTTP to 127.0.0.1:56388 / :8080 / :11434. Without
 	     this, URLSession silently refuses every load and the inference domain
