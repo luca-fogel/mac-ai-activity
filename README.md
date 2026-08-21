@@ -11,10 +11,12 @@ Headline metric: **joules per token** = system watts ÷ emitted tok/s, with the
 idle floor subtracted, so what you see is the marginal energy cost of inference
 rather than the cost of the machine being switched on.
 
-![Timeline view during a live generation](docs/images/timeline.png)
+![A live generation, from idle through prefill to decode](docs/images/demo.gif)
 
-*Jan's 4B model decoding at 50.9 tok/s: 98% GPU against 0.1% backend CPU, 101.8 W,
-93.7 °C, and the number that motivated the whole app — **2.0 joules per token**.*
+*Twelve seconds, unedited: an idle panel, a request arriving, prefill, then decode.
+Token bars fill, GPU goes to 97% while the backend process stays at 0.1% CPU,
+system draw steps 15.8 → 100 W, and **joules per token settles at 1.7** as the
+680-token generation finishes.*
 
 > Status: works on my machine and is used daily, but it has run on exactly one
 > Mac (M2 Max, macOS Tahoe). Sensor maps and engine quirks are measured, not
@@ -30,6 +32,14 @@ rather than the cost of the machine being switched on.
 | **Engines** | Which runtime is actually burning resources (hue is earned by residency) |
 | **Cooling** | How hot the die really is, what the fans are doing, and — with the root helper installed — what you want them to do instead |
 | **Sources** (⌘I) | Per-source health, measured rates, the app's own observer cost, and what is *not* measurable |
+
+### Timeline
+
+![Timeline view](docs/images/timeline.png)
+
+One generation on one time axis: 50.9 tok/s emitted, 98% GPU, 101.8 W, 93.7 °C,
+and 2.0 J/token. TTFT is shown as the interval `1.0–1.0 s` rather than a point,
+because the app is not the client and can only bracket it by the poll interval.
 
 ### Slots
 
