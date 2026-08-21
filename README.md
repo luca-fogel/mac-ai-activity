@@ -225,4 +225,13 @@ without overheating a laptop.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+**GPL-3.0** — see [LICENSE](LICENSE).
+
+Use it, run it, fork it, sell it. The one condition: if you distribute a
+derivative, ship its source under the same licence. The measurement work in
+[docs/ENGINEERING-NOTES.md](docs/ENGINEERING-NOTES.md) is the substance of this
+project, and it should stay readable by whoever ends up depending on it.
+
+The first commits of this repo were published under MIT for a few hours on
+2026-08-21. Anything obtained under that licence stays under it; everything from
+`Relicense under GPL-3.0` onward is GPL-3.0.

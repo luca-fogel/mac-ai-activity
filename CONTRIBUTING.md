@@ -47,6 +47,19 @@ reading, and write down the measurement in
 [`docs/ENGINEERING-NOTES.md`](docs/ENGINEERING-NOTES.md). The notes are the
 point of the project as much as the app is.
 
+## Sign your work (DCO)
+
+Add a `Signed-off-by` line to each commit — `git commit -s` does it for you:
+
+```
+Signed-off-by: Your Name <your.email@example.com>
+```
+
+That line is the [Developer Certificate of Origin](https://developercertificate.org/):
+you are stating that you wrote the patch, or otherwise have the right to submit
+it under this project's licence (GPL-3.0). It is one line, not a copyright
+assignment — you keep the copyright in your own work.
+
 ## Scope
 
 In scope: more engines, more hardware, better attribution, honest measurement.
