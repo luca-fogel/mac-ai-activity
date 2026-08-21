@@ -58,6 +58,34 @@ public struct Episode: Identifiable, Sendable {
     /// this anywhere else, and a negative energy would be worse than none.
     public var energyAccumInvalid = false
 
+    // MARK: Thermal envelope
+
+    /// Hottest die reading seen inside this generation, and where.
+    ///
+    /// Sampled at 1 Hz against a several-second thermal constant, so a
+    /// generation shorter than ~2 s legitimately has none — which is why this
+    /// is optional rather than seeded with the temperature at the start.
+    public var peakHotspotC: Double?
+    public var peakHotspotDomain: ThermalDomain?
+    public var startHotspotC: Double?
+    public var thermalSamples: Int = 0
+    /// Fastest fan observed during the generation, and whether the app was the
+    /// one commanding it. A tok/s figure measured under a forced fan is not
+    /// comparable with one measured under the SMC's own curve, and this is what
+    /// lets the Episodes view say so.
+    public var peakFanRPM: Double?
+    public var fansForced = false
+    /// The OS escalated thermal pressure at some point inside this generation:
+    /// the strongest evidence available that a slow run was slow because of heat.
+    public var worstPressure: ThermalState = .nominal
+
+    /// How much the die heated over the generation. nil unless both ends were
+    /// observed, because a rise computed from one sample is not a rise.
+    public var hotspotRiseC: Double? {
+        guard let a = startHotspotC, let b = peakHotspotC, thermalSamples >= 2 else { return nil }
+        return b - a
+    }
+
     public var duration: Double? { end.map { $0 - start } }
 
     /// The accumulator's delta in RAW units, or nil when unusable. Not joules.
@@ -145,6 +173,32 @@ public struct EpisodeTracker: Sendable {
         guard dt > 0, dt < 30 else { return }
         e.energyJoules += (w + pw) / 2 * dt
         e.energySamples += 1
+        episodes[episodes.count - 1] = e
+    }
+
+    /// Folds one thermal tick into the open episode.
+    ///
+    /// Nothing here is interpolated: with no open episode there is nothing to
+    /// record, and a generation that ended between two thermal ticks simply has
+    /// fewer samples, which `thermalSamples` reports.
+    public mutating func noteThermal(hotspotC: Double?,
+                                     domain: ThermalDomain?,
+                                     fanRPM: Double?,
+                                     fansForced: Bool,
+                                     pressure: ThermalState,
+                                     at t: Instant) {
+        guard var e = current else { return }
+        if let c = hotspotC {
+            if e.startHotspotC == nil { e.startHotspotC = c }
+            if c > (e.peakHotspotC ?? -.infinity) {
+                e.peakHotspotC = c
+                e.peakHotspotDomain = domain
+            }
+            e.thermalSamples += 1
+        }
+        if let f = fanRPM { e.peakFanRPM = max(e.peakFanRPM ?? 0, f) }
+        if fansForced { e.fansForced = true }
+        if pressure.severity > e.worstPressure.severity { e.worstPressure = pressure }
         episodes[episodes.count - 1] = e
     }
 

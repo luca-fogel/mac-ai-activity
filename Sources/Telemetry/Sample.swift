@@ -41,6 +41,14 @@ public enum EngineID: String, Sendable, Hashable, CaseIterable {
     case ollama
     case mlxlm      // Apple's mlx-lm server: a real HTTP endpoint, unlike
                     // Bionic's embedded MLX runtime which has no port at all
+    /// Jan. Also llama.cpp underneath, but structurally unlike Bionic: it runs
+    /// a llama-server ROUTER holding no weights, which spawns one child
+    /// llama-server per model on demand. So `.jan` is one engine with N live
+    /// instances, and its telemetry lives on the children's ports, not the
+    /// router's. Kept distinct from `.bionic` because both present as a
+    /// process named `llama-server` and folding them together made a running
+    /// Jan overwrite Bionic's descriptor once a second.
+    case jan
 
     public var displayName: String {
         switch self {
@@ -48,6 +56,7 @@ public enum EngineID: String, Sendable, Hashable, CaseIterable {
         case .localai: return "LocalAI"
         case .ollama:  return "Ollama"
         case .mlxlm:   return "mlx-lm"
+        case .jan:     return "Jan"
         }
     }
 }
@@ -63,6 +72,10 @@ public enum SourceKind: String, Sendable, Hashable, CaseIterable {
     /// not "no data". Kept separate from .slots, which carries a live-rate
     /// contract this source cannot honour.
     case predictions
+    /// SMC die sensors + fans, ~1 Hz. Distinct from `.system` because the SMC
+    /// is a separate microcontroller on a slow bus, and its failures are its
+    /// own: a wedged SMC must not read as a wedged collector.
+    case thermal
 }
 
 /// Identifies a specific *run* of a server process.
@@ -93,12 +106,30 @@ public enum Sample: Sendable {
     case power(PowerSample)
     case roster(EngineRoster)
     case prediction(PredictionSample)
+    /// Die temperatures, fans and cooling control. Its own domain because its
+    /// clock is its own: the SMC answers in ~200 us of BLOCKED time per key,
+    /// and die temperature moves on a several-second constant regardless.
+    case thermal(ThermalSample)
     case health(SourceHealth)
 }
 
 // MARK: - System domain (~10 Hz)
 
-public enum ThermalState: String, Sendable { case nominal, fair, serious, critical }
+public enum ThermalState: String, Sendable {
+    case nominal, fair, serious, critical
+
+    /// An explicit rank rather than a raw-value comparison, so "worst seen"
+    /// cannot silently depend on alphabetical order — under which `critical`
+    /// sorts below `fair`.
+    public var severity: Int {
+        switch self {
+        case .nominal:  return 0
+        case .fair:     return 1
+        case .serious:  return 2
+        case .critical: return 3
+        }
+    }
+}
 
 /// Discrete kernel pressure level. Rendered as the 3-state enum it is; drawing
 /// it as a smooth meter would invent resolution the source does not have.
@@ -274,13 +305,33 @@ public struct SamplerParams: Sendable, Equatable {
 ///
 /// So we publish the absolute token count (always true), both ratios with
 /// their denominators named, and mark the real window unavailable.
+///
+/// UNLESS the launch flags make it derivable, which is exactly the case under
+/// Jan: it launches with `--fit off`, so `--ctx-size` is a real allocation
+/// rather than an auto-fit target, and llama.cpp splits it evenly across
+/// `--parallel` slots. VERIFIED against a live Jan child — `--ctx-size 8192
+/// --parallel 2 --fit off` produced `n_ctx: 4096` per slot in /slots, equal to
+/// the child's own `n_ctx_slot = 4096`. In that configuration `n_ctx` is NOT
+/// the model maximum, it IS the allocated window, and the honest thing is to
+/// say so instead of reciting a caveat that does not apply.
 public struct ContextFill: Sendable {
     public var tokens: Int?
     /// --fit-ctx. A fit target. May legitimately be exceeded.
     public var fitTarget: Int?
-    /// n_ctx as reported. The model maximum, not the allocation.
+    /// n_ctx as reported by /slots. USUALLY the model maximum rather than the
+    /// allocation — but not under a router child with auto-fit off, where it is
+    /// the allocation. Which is why this is no longer named as either.
     public var modelMaximum: Int
-    /// The number the UI would love to show, and cannot.
+    /// n_ctx_train: what the model was trained to handle, which is a ceiling on
+    /// what it COULD be given, not what it was given.
+    ///
+    /// Only Jan exposes this, in the `ready` payload its children emit. It is
+    /// worth showing because the gap can be enormous and is actionable:
+    /// MEASURED, a Jan child was allocated 4096 tokens per slot from a model
+    /// trained for 262144 — a 64x headroom the user could reclaim by raising
+    /// ctx-size, and which no other engine here reports at all.
+    public var trainableMaximum: Int?
+    /// The number the UI would love to show, and usually cannot.
     public var allocatedWindow: Estimate<Int>
 
     public var exceededFitTarget: Bool {
@@ -296,12 +347,35 @@ public struct ContextFill: Sendable {
         return Double(t) / Double(modelMaximum)
     }
 
-    public init(tokens: Int?, fitTarget: Int?, modelMaximum: Int) {
+    /// The one honest occupancy ratio, available only when the window is known.
+    public var fractionOfAllocatedWindow: Double? {
+        guard let t = tokens, let w = allocatedWindow.value, w > 0 else { return nil }
+        return Double(t) / Double(w)
+    }
+
+    /// How much of the allocated window the model could have been given.
+    /// A value well below 1 means context was left on the table.
+    public var allocatedFractionOfTrainable: Double? {
+        guard let w = allocatedWindow.value, let m = trainableMaximum, m > 0 else { return nil }
+        return Double(w) / Double(m)
+    }
+
+    public init(tokens: Int?, fitTarget: Int?, modelMaximum: Int,
+                allocatedSlotContext: Int? = nil,
+                trainableMaximum: Int? = nil) {
         self.tokens = tokens
         self.fitTarget = fitTarget
         self.modelMaximum = modelMaximum
-        self.allocatedWindow = .unavailable(
-            "llama-server exposes no allocated per-slot context: n_ctx is the model maximum and --fit-ctx is a fit target, not a ceiling")
+        self.trainableMaximum = trainableMaximum
+        if let a = allocatedSlotContext, a > 0 {
+            // `.high` and not `.low`: this is arithmetic on two flags the
+            // server was demonstrably launched with, cross-checked against the
+            // value /slots reports, not an inference from behaviour.
+            self.allocatedWindow = .high(a)
+        } else {
+            self.allocatedWindow = .unavailable(
+                "llama-server exposes no allocated per-slot context: n_ctx is the model maximum and --fit-ctx is a fit target, not a ceiling")
+        }
     }
 }
 
@@ -310,12 +384,26 @@ public struct SlotSample: Sendable, Identifiable {
     /// Classified by the collector. The UI must not re-derive this.
     public var state: SlotState
 
+    /// Which model instance this slot belongs to, for engines that run more
+    /// than one at a time. nil for a single-instance engine.
+    ///
+    /// Jan needs this: with `--models-max 2` two child servers are resident
+    /// simultaneously, each numbering its own slots from 0, so a bare slot id
+    /// is ambiguous and merging on it would splice two models' counters into
+    /// one fictional track.
+    public var instance: String?
+
     /// What /slots reports: the MODEL MAXIMUM (262144), not the launched window.
     public var nCtxReported: Int
     /// From argv --fit-ctx (16384). The denominator that actually matters.
     /// nil means we could not determine it — the UI degrades to .unavailable
     /// rather than silently showing a 16x-wrong percentage.
     public var nCtxFitted: Int?
+    /// The EXACT per-slot window, when the launch flags pin it down
+    /// (`--fit off` + `--ctx-size` / `--parallel`). See ContextFill.
+    public var nCtxAllocated: Int?
+    /// n_ctx_train, when the engine states it. See ContextFill.
+    public var nCtxTrainable: Int?
 
     public var speculative: Bool
     public var specTypes: String?
@@ -338,10 +426,14 @@ public struct SlotSample: Sendable, Identifiable {
 
     /// Denominators kept separate on purpose — see ContextFill.
     public var context: ContextFill {
-        ContextFill(tokens: nPromptTokens, fitTarget: nCtxFitted, modelMaximum: nCtxReported)
+        ContextFill(tokens: nPromptTokens, fitTarget: nCtxFitted,
+                    modelMaximum: nCtxReported, allocatedSlotContext: nCtxAllocated,
+                    trainableMaximum: nCtxTrainable)
     }
 
     public init(id: Int, state: SlotState, nCtxReported: Int, nCtxFitted: Int?,
+                nCtxAllocated: Int? = nil, nCtxTrainable: Int? = nil,
+                instance: String? = nil,
                 speculative: Bool, specTypes: String? = nil, idTask: Int? = nil,
                 nPromptTokens: Int? = nil, nPromptTokensProcessed: Int? = nil,
                 nPromptTokensCache: Int? = nil, nDecoded: Int? = nil,
@@ -352,7 +444,9 @@ public struct SlotSample: Sendable, Identifiable {
                 timeToFirstToken: Estimate<Double> = .unavailable("no samples yet"),
                 cacheHitRate: Estimate<Double> = .unavailable("no samples yet")) {
         self.id = id; self.state = state; self.nCtxReported = nCtxReported
-        self.nCtxFitted = nCtxFitted; self.speculative = speculative
+        self.nCtxFitted = nCtxFitted; self.nCtxAllocated = nCtxAllocated
+        self.nCtxTrainable = nCtxTrainable
+        self.instance = instance; self.speculative = speculative
         self.specTypes = specTypes; self.idTask = idTask
         self.nPromptTokens = nPromptTokens
         self.nPromptTokensProcessed = nPromptTokensProcessed
@@ -656,4 +750,12 @@ public protocol TelemetryFeed: Sendable {
     func setCadence(_ mode: CadenceMode) async
     func start() async
     func stop() async
+    /// The fan-control handle, when this feed has one. A mock feed does not,
+    /// and neither does a feed on a machine with no helper installed — so the
+    /// UI must treat its absence as the ordinary case, not as a failure.
+    nonisolated var cooling: CoolingController? { get }
+}
+
+extension TelemetryFeed {
+    public nonisolated var cooling: CoolingController? { nil }
 }

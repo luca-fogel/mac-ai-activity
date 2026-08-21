@@ -28,8 +28,29 @@ public actor LiveTelemetryFeed: TelemetryFeed {
     /// LMStudioProbe already demonstrates what attaching one of those to this
     /// actor costs — a ~240 ms stall of every other collector, every 5 s.
     private let lms = LMSLogStream()
+    /// Also its own thread, for the same reason and with a measured number
+    /// behind it: an SMC sweep blocks for ~13 ms, which inside this actor
+    /// would be a 13 ms hole in the 10 Hz system loop once a second.
+    public nonisolated let thermal = ThermalProbe()
 
     private var machines: [EngineID: SlotStateMachine] = [:]
+    /// Jan runs several model servers at once, each numbering its slots from 0,
+    /// so its state machines are keyed by instance pid rather than by engine.
+    /// Keying on the alias instead would carry a track across an unload/reload
+    /// of the same model — a re-spawned server with reset counters, which is
+    /// exactly the case a state machine must be torn down for.
+    private var janMachines: [Int32: SlotStateMachine] = [:]
+    private var janClients: [Int32: LlamaSlotsClient] = [:]
+    private var janRouter: JanRouterClient?
+    private var janRouterPort: UInt16?
+    private var janCatalogue: [JanRouterClient.CatalogEntry] = []
+    private var janLog: JanLogStream?
+    private var janState: [UInt16: JanLogStream.InstanceState] = [:]
+    /// Jan's instance processes, for the system sampler. The router owns the
+    /// port but holds no weights: MEASURED, the router's footprint was 45 MB
+    /// while its 4B-model child held 3.0 GB, so sampling only the descriptor's
+    /// pid reports ~1.5% of what Jan is holding.
+    private var janProcs: [(pid: Int32, startedAt: UInt64, label: String)] = []
     private var mlxTailer: MLXLogTailer?
     /// Whether each engine is doing work right now. Without this the roster
     /// reported every engine as idle, so the UI fell back to "largest resident"
@@ -63,6 +84,8 @@ public actor LiveTelemetryFeed: TelemetryFeed {
 
     public func setCadence(_ mode: CadenceMode) { cadence = mode }
 
+    public nonisolated var cooling: CoolingController? { thermal.cooling }
+
     public func start() {
         guard !running else { return }
         running = true
@@ -71,6 +94,7 @@ public actor LiveTelemetryFeed: TelemetryFeed {
             Task { [weak self] in await self?.slowLoop() },
             Task { [weak self] in await self?.inferenceLoop() },
             Task { [weak self] in await self?.predictionLoop() },
+            Task { [weak self] in await self?.thermalLoop() },
         ]
     }
 
@@ -80,6 +104,10 @@ public actor LiveTelemetryFeed: TelemetryFeed {
         tasks.removeAll()
         let stream = lms
         Task { await stream.stop() }
+        // Releases any fan lease on the way out. The helper would time it out
+        // in 15 s regardless, which is what makes this a courtesy and not a
+        // safety mechanism.
+        thermal.stop()
         cont.finish()
     }
 
@@ -110,6 +138,38 @@ public actor LiveTelemetryFeed: TelemetryFeed {
                            outcome: outcome, latency: 0)
             }
         }
+    }
+
+    // MARK: - Stream E: SMC thermal + cooling, 1 Hz, own thread
+
+    /// Pumps the thermal thread's stream into the shared one.
+    ///
+    /// The probe is `absent`, not `dark`, when the SMC will not open: a machine
+    /// whose sensors we cannot read has not failed, and a red chip there would
+    /// be the same lie as reporting a stopped server as an error.
+    private func thermalLoop() async {
+        guard thermal.isAvailable else {
+            emitHealth(.thermal, engine: nil, t: Instant.now(),
+                       outcome: .other("AppleSMC exposed no readable die sensors"),
+                       latency: 0)
+            return
+        }
+        thermal.start()
+        for await s in thermal.samples {
+            guard running, !Task.isCancelled else { break }
+            cont.yield(.thermal(s))
+            emitHealth(.thermal, engine: nil, t: s.t, outcome: .ok,
+                       latency: s.sampleCostMicros / 1e6)
+        }
+    }
+
+    /// Tells the thermal thread whether work is in flight.
+    ///
+    /// This is what makes a boost policy pre-emptive rather than reactive: a
+    /// fan told to spin at the START of a generation is at speed by the time
+    /// the die is hot, which a temperature curve can never manage.
+    private func refreshGenerating() {
+        thermal.setGenerating(busyByEngine.values.contains(true))
     }
 
     // MARK: - Stream A: native, 2-10 Hz
@@ -156,8 +216,15 @@ public actor LiveTelemetryFeed: TelemetryFeed {
 
     private func sampleProcesses(at t: Instant, dt: Double) -> [ProcSample] {
         var out: [ProcSample] = []
-        for (engine, d) in descriptors {
-            let pid = d.generation.pid
+        var targets: [(pid: Int32, startedAt: UInt64, engine: EngineID, label: String)] =
+            descriptors.map { ($0.value.generation.pid, $0.value.generation.startedAt,
+                              $0.key, $0.value.command) }
+        // Jan's model instances, which are where all of its memory actually is.
+        targets.append(contentsOf: janProcs.map {
+            ($0.pid, $0.startedAt, EngineID.jan, $0.label) })
+
+        for target in targets {
+            let pid = target.pid
             guard let ti = ProcSampler.taskInfo(pid) else { continue }
             let nanos = ti.pti_total_user &+ ti.pti_total_system
 
@@ -169,8 +236,8 @@ public actor LiveTelemetryFeed: TelemetryFeed {
 
             let ru = ProcSampler.rusage(pid)
             out.append(ProcSample(
-                pid: pid, startedAt: d.generation.startedAt, engine: engine,
-                command: d.command,
+                pid: pid, startedAt: target.startedAt, engine: target.engine,
+                command: target.label,
                 cpuFraction: frac, cpuNanos: nanos,
                 wired: ru?.ri_wired_size ?? 0,
                 footprint: ru?.ri_phys_footprint ?? UInt64(ti.pti_resident_size),
@@ -179,7 +246,7 @@ public actor LiveTelemetryFeed: TelemetryFeed {
                 energyNanoJoules: ru?.ri_energy_nj ?? 0))
         }
         // Drop bookkeeping for processes that are gone.
-        let live = Set(descriptors.values.map { $0.generation.pid })
+        let live = Set(targets.map { $0.pid })
         prevCPU = prevCPU.filter { live.contains($0.key) }
         return out.sorted { $0.pid < $1.pid }
     }
@@ -200,6 +267,13 @@ public actor LiveTelemetryFeed: TelemetryFeed {
                 failures[e] = 0
                 nextAttemptAt[e] = nil
                 busyByEngine[e] = false
+                if e == .jan {
+                    // A new router means new instances on new ports with a new
+                    // key. Nothing from the previous one survives.
+                    janMachines.removeAll(); janClients.removeAll()
+                    janRouter = nil; janRouterPort = nil; janCatalogue = []
+                    janState.removeAll()
+                }
             }
             // mlx-lm's telemetry is a log, not a socket, so it needs retiring
             // explicitly when the server goes away.
@@ -220,10 +294,18 @@ public actor LiveTelemetryFeed: TelemetryFeed {
                 machines[d.engine] = machines[d.engine] ?? SlotStateMachine()
             }
 
+            let topology = await registry.janTopology()
+            await refreshJan(topology, at: t)
+
             // Process discovery finds llama.cpp/LocalAI/Ollama. It CANNOT find
             // the MLX backend -- that runs inside a node host with no listening
             // socket -- so ask LM Studio directly for what it has resident.
-            var entries = runtimes.map(rosterEntry)
+            // The generic descriptor row for Jan is replaced, not kept: the
+            // process that owns the port is the router, and describing it with
+            // the same fields as a model server would report a runtime holding
+            // a nil model in a 0-token context.
+            var entries = runtimes.filter { $0.engine != .jan }.map(rosterEntry)
+            entries.append(contentsOf: janRosterEntries(topology))
             for m in LMStudioProbe.snapshot() where m.isMLX {
                 entries.append(RuntimeInfo(
                     engine: .bionic, backend: "MLX (embedded)", busy: m.isBusy,
@@ -235,6 +317,13 @@ public actor LiveTelemetryFeed: TelemetryFeed {
                     nCtxFitted: m.contextLength,
                     reachable: true,
                     residentBytes: m.sizeBytes))
+            }
+            // The embedded MLX engine is visible ONLY here, so a generation
+            // running on it would otherwise never reach the boost policy.
+            if entries.contains(where: { $0.busy && !$0.exposesTokenTelemetry }) {
+                thermal.setGenerating(true)
+            } else {
+                refreshGenerating()
             }
             cont.yield(.roster(EngineRoster(t: t, runtimes: entries)))
             // .roster is a declared source; without this it never reported and
@@ -296,6 +385,284 @@ public actor LiveTelemetryFeed: TelemetryFeed {
             residentBytes: ru?.ri_phys_footprint ?? 0)
     }
 
+    // MARK: - Jan: router-and-instances
+
+    /// Keeps the Jan clients in step with the topology, and reads the router's
+    /// catalogue.
+    ///
+    /// The catalogue is the ONLY thing asked of the router, because it is the
+    /// only question that is free of side effects: `/v1/models` takes no model
+    /// name and no key. `/props?model=` and `/slots?model=` would both name a
+    /// model, and naming an unloaded model makes the router LOAD it — see
+    /// `JanTopology.loadHazard`. An observer that can cause a 3 GB read is not
+    /// an observer.
+    private func refreshJan(_ topology: JanTopology?, at t: Instant) async {
+        guard let topology else {
+            janRouter = nil; janRouterPort = nil; janCatalogue = []
+            janClients.removeAll(); janMachines.removeAll(); janState.removeAll()
+            janProcs = []
+            janLog = nil
+            busyByEngine[.jan] = false
+            return
+        }
+
+        janProcs = topology.instances.map {
+            ($0.pid, $0.startedAt, "llama-server (\($0.alias))")
+        }
+
+        if janRouter == nil || janRouterPort != topology.routerPort {
+            janRouter = JanRouterClient(host: topology.routerHost,
+                                        port: topology.routerPort)
+            janRouterPort = topology.routerPort
+        }
+
+        // The log is Jan's real telemetry channel; see JanLogStream.
+        if janLog == nil, FileManager.default.fileExists(atPath: JanLogStream.defaultPath) {
+            janLog = JanLogStream()
+        }
+
+        // Instances come and go as the router loads and unloads models, so the
+        // client set is rebuilt against the live pids and anything not in it is
+        // dropped along with its derived state.
+        let live = Set(topology.instances.map { $0.pid })
+        janClients = janClients.filter { live.contains($0.key) }
+        janMachines = janMachines.filter { live.contains($0.key) }
+        for i in topology.instances where janClients[i.pid] == nil {
+            janClients[i.pid] = LlamaSlotsClient(
+                host: i.host, port: i.port, key: topology.key, timeout: 2.0)
+            janMachines[i.pid] = SlotStateMachine()
+        }
+
+        if let router = janRouter {
+            do {
+                janCatalogue = try await router.catalogue()
+                emitHealth(.roster, engine: .jan, t: t, outcome: .ok,
+                           latency: Instant.now() - t)
+            } catch {
+                janCatalogue = []
+                emitHealth(.roster, engine: .jan, t: t,
+                           outcome: Self.classify(error), latency: Instant.now() - t)
+            }
+        }
+    }
+
+    /// One roster row per Jan instance, plus one per model the router knows
+    /// about but has not loaded.
+    ///
+    /// The unloaded rows matter: with `--models-max 2` Jan will load a model on
+    /// demand and evict another, so "what could be running" is part of reading
+    /// what Jan is doing. They are marked unreachable and holding nothing,
+    /// which is exactly true — there is no process behind them.
+    private func janRosterEntries(_ topology: JanTopology?) -> [RuntimeInfo] {
+        guard let topology else { return [] }
+        var out: [RuntimeInfo] = []
+        var named: Set<String> = []
+
+        // The router itself. It holds no weights, so it is described as what it
+        // is rather than as a model server -- and it is listed even with no
+        // model loaded, because otherwise a running, healthy Jan with an idle
+        // router would be indistinguishable from Jan not running at all.
+        out.append(RuntimeInfo(
+            engine: .jan,
+            backend: "llama.cpp router",
+            busy: false,
+            exposesTokenTelemetry: false,
+            telemetryGap: JanTopology.routerRowNote,
+            generation: EndpointGeneration(pid: topology.routerPID,
+                                           startedAt: topology.routerStartedAt,
+                                           port: topology.routerPort),
+            endpoint: "\(topology.routerHost):\(topology.routerPort)",
+            modelName: nil,
+            totalSlots: topology.facts.modelsMax,
+            reachable: true,
+            residentBytes: ProcSampler.rusage(topology.routerPID)?.ri_phys_footprint ?? 0))
+
+        for i in topology.instances {
+            named.insert(i.alias)
+            let ru = ProcSampler.rusage(i.pid)
+            let st = janState[i.port]
+            let meta = st?.meta
+            out.append(RuntimeInfo(
+                engine: .jan,
+                backend: i.isEmbedding ? "llama.cpp (embeddings)" : "llama.cpp",
+                busy: st?.decoding ?? false,
+                // The log gives strictly more than /slots does, at no cost to
+                // the decode loop -- but only if it is actually there.
+                exposesTokenTelemetry: janLog != nil,
+                telemetryGap: janLog == nil
+                    ? "no log at \(JanLogStream.defaultPath) — token rates fall back to polling each instance's /slots"
+                    : JanTopology.metricsGap,
+                generation: EndpointGeneration(pid: i.pid, startedAt: i.startedAt,
+                                               port: i.port),
+                endpoint: "\(i.host):\(i.port)",
+                modelName: i.alias,
+                // llama.cpp's own ftype, when the child has announced itself.
+                // Strictly better than the filename guess: every Jan model is
+                // stored as `<id>/model.gguf`, so there is no quantization in
+                // the path at all.
+                quantization: meta?.ftype ?? i.facts.quantization,
+                paramCount: meta?.nParams,
+                fileBytes: meta?.sizeBytes,
+                // n_ctx_train is the model maximum; n_ctx is what was allocated.
+                nCtxReported: meta?.nCtxTrain,
+                nCtxFitted: i.facts.allocatedSlotContext ?? meta?.nCtx,
+                totalSlots: i.facts.parallelSlots,
+                speculativeType: i.facts.speculativeType,
+                flashAttention: i.facts.flashAttention,
+                loadMode: i.facts.loadMode,
+                reachable: true,
+                residentBytes: ru?.ri_phys_footprint ?? 0))
+        }
+
+        for c in janCatalogue where !named.contains(c.id) {
+            out.append(RuntimeInfo(
+                engine: .jan,
+                backend: c.isEmbedding ? "llama.cpp (embeddings)" : "llama.cpp",
+                busy: false,
+                exposesTokenTelemetry: false,
+                telemetryGap: "not loaded — the router will start it on demand, and this app will not ask it to",
+                endpoint: "—",
+                modelName: c.id,
+                quantization: c.facts.quantization,
+                nCtxFitted: c.facts.allocatedSlotContext,
+                totalSlots: c.facts.parallelSlots,
+                reachable: false,
+                residentBytes: 0))
+        }
+        return out
+    }
+
+    /// Reads Jan's log, and polls instance /slots only for what the log cannot
+    /// say.
+    ///
+    /// Order matters. The log is free and richer, so it goes first and sets the
+    /// busy state; /slots is then polled for the two things the log genuinely
+    /// does not carry — live context occupancy and the sampler settings in
+    /// force — and only against instances that are actually working. An idle
+    /// instance is not polled at all, which is what keeps the cost of watching
+    /// an idle Jan at zero.
+    private func pollJan(_ topology: JanTopology) async {
+        let t = Instant.now()
+
+        if let log = janLog {
+            let snap = log.poll(now: t)
+            for (port, st) in snap.instances { janState[port] = st }
+            for r in snap.receipts { cont.yield(.prediction(Self.prediction(from: r, at: t))) }
+            if !snap.receipts.isEmpty {
+                emitHealth(.predictions, engine: .jan, t: t, outcome: .ok, latency: 0)
+            }
+        }
+
+        // ONE sample per tick, carrying every instance's slots.
+        //
+        // Not one sample per instance: the consumer keys the inference domain
+        // by engine, so two Jan instances decoding at once would overwrite each
+        // other and the UI would flip between two models' slots at the poll
+        // rate. Merging is safe precisely because each SlotSample now names its
+        // instance, so nothing is fused -- the slots stay individually
+        // attributed, and their state machines stay per-instance so no counter
+        // ever crosses between models.
+        let issued = Instant.now()
+        var slots: [SlotSample] = []
+        var repairs = 0
+        var advanced = false
+        var anyBusy = false
+        var polled = false
+        var failure: Error?
+
+        for i in topology.generativeInstances {
+            let st = janState[i.port]
+            let decoding = st?.decoding ?? false
+            if decoding { anyBusy = true }
+            // Poll a slot only while there is a request in it. Between
+            // generations /slots serves the previous request's frozen counters,
+            // which the state machine would have to discard anyway -- and not
+            // polling an idle Jan at all is what keeps the cost of watching one
+            // at zero.
+            guard decoding, let client = janClients[i.pid] else { continue }
+            do {
+                let (raw, r) = try await client.slots()
+                let t = Instant.now()
+                polled = true
+                repairs += r
+                var machine = janMachines[i.pid] ?? SlotStateMachine()
+                for rawSlot in raw {
+                    let s = machine.update(
+                        rawSlot, at: t,
+                        fittedContext: i.facts.allocatedSlotContext,
+                        // Under Jan this is a KNOWN quantity, not a caveat: the
+                        // child was launched with --fit off, so --ctx-size is a
+                        // real allocation split across --parallel slots, and
+                        // the n_ctx in this very payload equals it.
+                        allocatedContext: i.facts.allocatedSlotContext,
+                        // The model's own trained ceiling, which only Jan says.
+                        trainableContext: st?.meta?.nCtxTrain,
+                        instance: i.alias)
+                    if s.state == .processing,
+                       s.decodeTokensPerSecond.value ?? 0 > 0 { advanced = true }
+                    slots.append(s)
+                }
+                janMachines[i.pid] = machine
+            } catch {
+                failure = error
+            }
+        }
+
+        busyByEngine[.jan] = anyBusy
+        refreshGenerating()
+        if advanced { confirmedAdvance = true }
+
+        if polled {
+            let t = Instant.now()
+            cont.yield(.inference(InferenceSample(
+                requestedAt: issued, t: t, engine: .jan,
+                // The ROUTER's generation, not an instance's. The router is
+                // Jan's stable identity: instances are spawned and evicted as
+                // models load, so keying the domain to one of them would
+                // declare a new endpoint generation -- and tear down all
+                // derived state -- every time a model swapped.
+                generation: EndpointGeneration(pid: topology.routerPID,
+                                               startedAt: topology.routerStartedAt,
+                                               port: topology.routerPort),
+                slots: slots, malformedRepairs: repairs)))
+            slotPollTimes.append((t, (t - issued) * 1000))
+            slotPollTimes.removeAll { t - $0.t > 60 }
+            emitHealth(.slots, engine: .jan, t: t, outcome: .ok, latency: t - issued)
+        } else if let failure {
+            let t = Instant.now()
+            emitHealth(.slots, engine: .jan, t: t,
+                       outcome: Self.classify(failure), latency: t - issued)
+        }
+    }
+
+    /// Turns a log receipt into the app's existing prediction-receipt type.
+    ///
+    /// These are `.high` confidence where LM Studio's are not, and for a
+    /// concrete reason: every number is a clock reading llama.cpp took itself
+    /// and printed. In particular the TTFT is the true prefill duration, not
+    /// the poll-interval bracket `/slots` forces this app to publish
+    /// everywhere else.
+    private static func prediction(from r: JanLogStream.Receipt,
+                                   at t: Instant) -> PredictionSample {
+        PredictionSample(
+            t: t, engine: .jan,
+            modelIdentifier: r.alias ?? "unknown",
+            // llama.cpp's log does not name a finish reason. `truncated` is the
+            // one thing it does say about how the request ended, and inventing
+            // "eosFound" from its absence would be a guess.
+            stopReason: (r.truncated == true) ? "contextTruncated" : "reported by llama.cpp",
+            tokensPerSecond: r.decodeTokensPerSecond.map { .high($0) }
+                ?? .unavailable("no eval-time line in the log for this request"),
+            timeToFirstToken: r.timeToFirstToken.map { .high($0) }
+                ?? .unavailable("no prompt-eval line in the log for this request"),
+            draftAccepted: .unavailable("speculative decoding is not configured by Jan"),
+            totalSeconds: r.totalMillis.map { $0 / 1000 },
+            promptTokens: r.promptTokens,
+            predictedTokens: r.decodedTokens,
+            totalTokens: r.totalTokens,
+            source: "Jan app.log (llama.cpp print_timing)")
+    }
+
     // MARK: - Stream B: /slots, <= 1 Hz, single in-flight
 
     private func inferenceLoop() async {
@@ -318,6 +685,7 @@ public actor LiveTelemetryFeed: TelemetryFeed {
                 await pollSlots(engine: engine, client: client, descriptor: d)
             }
             if descriptors[.mlxlm] != nil { pollMLX() }
+            if let topology = await registry.janTopology() { await pollJan(topology) }
             try? await Task.sleep(nanoseconds: UInt64(interval * 1e9))
         }
     }
@@ -340,6 +708,7 @@ public actor LiveTelemetryFeed: TelemetryFeed {
             }
             machines[engine] = machine
             busyByEngine[engine] = slots.contains { $0.state.isBusy }
+            refreshGenerating()
             if advanced { confirmedAdvance = true }
 
             cont.yield(.inference(InferenceSample(
@@ -397,6 +766,7 @@ public actor LiveTelemetryFeed: TelemetryFeed {
         let slot = machine.update(raw, at: t, fittedContext: d.facts.fittedContext)
         machines[.mlxlm] = machine
         busyByEngine[.mlxlm] = slot.state.isBusy
+        refreshGenerating()
 
         cont.yield(.inference(InferenceSample(
             requestedAt: t, t: t, engine: .mlxlm,

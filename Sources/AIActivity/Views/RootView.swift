@@ -6,6 +6,7 @@ enum Tab: String, CaseIterable, Identifiable {
     case timeline = "Timeline"
     case slots = "Slots"
     case engines = "Engines"
+    case cooling = "Cooling"
     var id: String { rawValue }
 }
 
@@ -25,6 +26,7 @@ struct RootView: View {
                 case .timeline: GenerationTimelineView()
                 case .slots:    SlotsView()
                 case .engines:  EnginesView()
+                case .cooling:  CoolingView()
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -36,7 +38,7 @@ struct RootView: View {
                     ForEach(Tab.allCases) { Text($0.rawValue).tag($0) }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 260)
+                .frame(width: 330)
             }
             ToolbarItem(placement: .primaryAction) {
                 Button { showSources.toggle() } label: {

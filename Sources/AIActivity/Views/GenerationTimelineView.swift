@@ -68,6 +68,14 @@ struct GenerationTimelineView: View {
             lane("Memory", trailing: memoryTrailing) {
                 MemoryLane(sample: hub.latestSystem)
             }
+            // Between GPU and Power on purpose: heat is the CONSEQUENCE of the
+            // GPU trace above it and the cause of any throttling in the token
+            // trace higher up, and the lag between them is only visible if they
+            // share an axis.
+            lane("Die temperature", trailing: thermalTrailing) {
+                ThermalLane(temps: hub.tempSeries, fans: hub.fanSeries,
+                            window: window, axis: axis)
+            }
             lane("Power", trailing: powerTrailing) {
                 PowerLane(series: hub.wattSeries, window: window, axis: axis)
             }
@@ -108,6 +116,19 @@ struct GenerationTimelineView: View {
         }
         .frame(height: 14)
         .padding(.horizontal, T.padPanel)
+    }
+
+    private var thermalTrailing: String? {
+        guard let th = hub.latestThermal else { return nil }
+        var parts: [String] = []
+        if let h = th.hotspot, let v = h.estimate.value {
+            parts.append("\(h.domain.displayName) \(Fmt.celsius(v, decimals: 1))")
+        }
+        if let rpm = th.fans.compactMap({ $0.actualRPM }).max() {
+            parts.append(Fmt.rpm(rpm))
+        }
+        if th.control?.forcing == true { parts.append("fans held") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     // MARK: - Derived series

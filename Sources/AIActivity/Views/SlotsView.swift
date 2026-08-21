@@ -28,7 +28,12 @@ struct SlotCard: View {
     let slot: SlotSample
 
     var body: some View {
-        Panel(title: "Slot \(slot.id)", trailing: trailing) {
+        // The instance qualifies the slot id. Jan runs up to --models-max
+        // model servers at once and each numbers its slots from 0, so "Slot 0"
+        // alone names two different things on the same screen.
+        Panel(title: slot.instance.map { "\($0) · slot \(slot.id)" }
+                     ?? "Slot \(slot.id)",
+              trailing: trailing) {
             switch slot.state {
             case .neverUsed:
                 VStack(alignment: .leading, spacing: 6) {
@@ -119,21 +124,44 @@ struct ContextCompositionBar: View {
             Text("cached and computed freeze after prefill; generated grows live")
                 .font(.system(size: 9)).foregroundStyle(T.inkMuted)
 
-            // The falsified hypothesis, shown rather than hidden.
+            // Two different worlds, and the difference is not cosmetic.
+            //
+            // Normally the allocated window is unknowable, so the honest thing
+            // is to show both candidate denominators, name them, and say why
+            // neither is the answer. But when the launch flags pin the window
+            // down exactly -- auto-fit off, so ctx-size divided by parallel IS
+            // the allocation -- there is one true ratio, and reciting the
+            // caveat instead of the number would be false modesty.
             VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 14) {
-                    denom("vs --fit-ctx \(Fmt.tokens(c.fitTarget))",
-                          c.fractionOfFitTarget, warn: c.exceededFitTarget)
-                    denom("vs n_ctx \(Fmt.tokens(c.modelMaximum)) (model max)",
-                          c.fractionOfModelMaximum, warn: false)
+                if let window = c.allocatedWindow.value {
+                    denom("of the \(Fmt.tokens(window))-token window allocated to this slot",
+                          c.fractionOfAllocatedWindow, warn: false)
+                    Text("exact: the server was launched with auto-fit off, so --ctx-size is a real allocation split across --parallel slots — and /slots reports this same number as n_ctx")
+                        .font(.system(size: 9)).foregroundStyle(T.inkDisabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                    // Headroom, when the engine says what the model could take.
+                    if let trainable = c.trainableMaximum,
+                       let frac = c.allocatedFractionOfTrainable, frac < 0.95 {
+                        Text("the model was trained for \(Fmt.tokens(trainable)) tokens — this slot was given \(Fmt.pct(frac)) of that")
+                            .font(.system(size: 9)).foregroundStyle(T.inkMuted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    // The falsified hypothesis, shown rather than hidden.
+                    HStack(spacing: 14) {
+                        denom("vs --fit-ctx \(Fmt.tokens(c.fitTarget))",
+                              c.fractionOfFitTarget, warn: c.exceededFitTarget)
+                        denom("vs n_ctx \(Fmt.tokens(c.modelMaximum)) (model max)",
+                              c.fractionOfModelMaximum, warn: false)
+                    }
+                    if c.exceededFitTarget {
+                        Text("⚠ the server exceeded its --fit-ctx target, so that flag is a fit hint, not a ceiling")
+                            .font(.system(size: 9)).foregroundStyle(T.warning)
+                    }
+                    Text(c.allocatedWindow.confidence.reason ?? "")
+                        .font(.system(size: 9)).foregroundStyle(T.inkDisabled)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                if c.exceededFitTarget {
-                    Text("⚠ the server exceeded its --fit-ctx target, so that flag is a fit hint, not a ceiling")
-                        .font(.system(size: 9)).foregroundStyle(T.warning)
-                }
-                Text(c.allocatedWindow.confidence.reason ?? "")
-                    .font(.system(size: 9)).foregroundStyle(T.inkDisabled)
-                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

@@ -51,6 +51,8 @@ struct EpisodesView: View {
             Text("DURATION").frame(width: 76, alignment: .trailing)
             Text("PREFILL").frame(width: 66, alignment: .trailing)
             Text("PEAK GPU").frame(width: 74, alignment: .trailing)
+            Text("PEAK °C").frame(width: 76, alignment: .trailing)
+                .help("hottest die sensor inside the generation, and the rise from its start")
             Text("ENERGY").frame(width: 76, alignment: .trailing)
             Text("TOKENS").frame(width: 62, alignment: .trailing)
             Text("J / TOKEN").frame(width: 78, alignment: .trailing)
@@ -62,6 +64,48 @@ struct EpisodesView: View {
         .font(.system(size: 10, weight: .medium)).kerning(0.5)
         .foregroundStyle(T.inkMuted)
         .padding(.vertical, 6)
+    }
+
+    /// Peak die temperature, with the rise as a caption.
+    ///
+    /// A generation shorter than two thermal ticks legitimately has no rise,
+    /// and one that ran with the fans held is not comparable with one that did
+    /// not — both are said here rather than left for the reader to assume.
+    @ViewBuilder
+    private func peakTemp(_ e: Episode) -> some View {
+        VStack(alignment: .trailing, spacing: 0) {
+            HStack(spacing: 3) {
+                if e.fansForced {
+                    Image(systemName: "fan.fill").font(.system(size: 8))
+                        .foregroundStyle(T.warning)
+                }
+                Text(e.peakHotspotC.map { Fmt.celsius($0, decimals: 1) } ?? Fmt.dash)
+                    .font(T.mono)
+                    .foregroundStyle((e.peakHotspotC ?? 0) >= 90 ? T.serious : T.inkSecondary)
+            }
+            if let rise = e.hotspotRiseC {
+                Text(String(format: "%+.1f", rise))
+                    .font(.system(size: 9)).foregroundStyle(T.inkMuted)
+            } else if e.thermalSamples == 1 {
+                Text("1 sample").font(.system(size: 9)).foregroundStyle(T.inkDisabled)
+            }
+        }
+        .frame(width: 76, alignment: .trailing)
+        .help(helpText(e))
+    }
+
+    private func helpText(_ e: Episode) -> String {
+        var parts: [String] = []
+        if let d = e.peakHotspotDomain { parts.append("hottest on \(d.displayName)") }
+        parts.append("\(e.thermalSamples) thermal samples at 1 Hz")
+        if let f = e.peakFanRPM { parts.append("peak fan \(Fmt.rpm(f))") }
+        if e.fansForced {
+            parts.append("FANS WERE HELD BY THIS APP during this generation — throughput here is not comparable with a run on the SMC's own curve")
+        }
+        if e.worstPressure != .nominal {
+            parts.append("OS thermal pressure reached \(e.worstPressure.rawValue)")
+        }
+        return parts.joined(separator: "\n")
     }
 
     private func row(_ e: Episode, live: Bool) -> some View {
@@ -82,6 +126,7 @@ struct EpisodesView: View {
             mono(e.duration.map { String(format: "%.1f s", $0) } ?? "running", 76)
             mono(e.prefillSeconds.map { String(format: "%.1f s", $0) } ?? Fmt.dash, 66)
             mono(Fmt.pct(e.peakGPU), 74)
+            peakTemp(e)
             mono(e.energy.value.map { String(format: "%.0f J", $0) } ?? Fmt.dash, 76)
             mono(e.tokens.map(String.init) ?? Fmt.dash, 62)
                 .help(e.reportedBy.map { "token count reported by the engine via \($0)" }

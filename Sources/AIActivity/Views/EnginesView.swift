@@ -28,8 +28,20 @@ struct EnginesView: View {
         }
     }
 
+    /// Matched by PID, not by engine.
+    ///
+    /// One engine can own several processes: Jan runs a router plus one model
+    /// server per loaded model, and each is a separate roster row. Matching on
+    /// engine gave every Jan row the first Jan process's memory — so the router
+    /// (45 MB) and a 3 GB model instance reported identical footprints, and
+    /// whichever number appeared was wrong for at least one of the rows.
     private func procFor(_ r: RuntimeInfo) -> ProcSample? {
-        hub.latestSystem?.procs.first { $0.engine == r.engine }
+        if let pid = r.generation?.pid {
+            return hub.latestSystem?.procs.first { $0.pid == pid }
+        }
+        // A row with no process behind it (a model the router has not loaded)
+        // must show dashes, not another row's numbers.
+        return nil
     }
 
     private var headerRow: some View {
@@ -154,8 +166,21 @@ struct WhereTheWorkIs: View {
         }
     }
 
+    /// The backend CPU of whichever engine is actually working, summed over
+    /// all of that engine's processes.
+    ///
+    /// Was pinned to `.bionic`, which read as a dash for the entire duration of
+    /// any generation on another engine — the row claimed "not measurable" when
+    /// the truth was "measured, on a process we declined to look at". Summing
+    /// matters for Jan specifically: the work happens in a model child, not in
+    /// the router that owns the port.
     private var cpu: Double? {
-        hub.latestSystem?.procs.first { $0.engine == .bionic }?.cpuFraction
+        guard let procs = hub.latestSystem?.procs, !procs.isEmpty else { return nil }
+        let working = hub.roster.first { $0.busy }?.engine
+            ?? (procs.contains { $0.engine == .bionic } ? .bionic : procs[0].engine)
+        let matching = procs.filter { $0.engine == working }
+        guard !matching.isEmpty else { return nil }
+        return matching.reduce(0) { $0 + $1.cpuFraction }
     }
 
     private func meter(_ label: String, _ v: Double?, tint: Color) -> some View {

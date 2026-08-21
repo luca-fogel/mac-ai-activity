@@ -40,6 +40,20 @@ enum Fmt {
         return String(format: "%.1f W", v)
     }
 
+    static func celsius(_ v: Double?, decimals: Int = 0) -> String {
+        guard let v else { return dash }
+        return String(format: "%.\(decimals)f °C", v)
+    }
+
+    /// 0 rpm is a MEASUREMENT on this hardware, not a missing one: the SMC
+    /// stops both fans entirely when the machine is cool, well below the
+    /// 2317 rpm minimum it will accept as a forced target.
+    static func rpm(_ v: Double?) -> String {
+        guard let v else { return dash }
+        if v < 1 { return "stopped" }
+        return String(format: "%.0f rpm", v)
+    }
+
     static func rate(_ v: Double?) -> String {
         guard let v else { return dash }
         return String(format: "%.1f", v)

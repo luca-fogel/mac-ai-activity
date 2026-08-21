@@ -19,6 +19,10 @@ let package = Package(
         // The CLI. LM Studio already shows tok/s and TTFT well; the one thing it
         // cannot show is energy, so this tool does only that part.
         .executableTarget(name: "aienergy", dependencies: ["Telemetry"]),
+        // The privileged half of fan control, and the ONLY thing here that
+        // writes to hardware. Runs as a root LaunchDaemon; the app talks to it
+        // over a unix socket and is not trusted by it.
+        .executableTarget(name: "aithermald", dependencies: ["Telemetry"]),
         .testTarget(name: "TelemetryTests", dependencies: ["Telemetry"]),
     ]
 )

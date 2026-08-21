@@ -1,4 +1,15 @@
+# Build products
 .build/
 build/
+.swiftpm/
+*.xcuserstate
+
+# Generated from Resources/icon-1024.png by build.sh
 Resources/AppIcon.icns
+
+# Local agent / tooling state
+.claude-flow/
+.claude/
+
+# macOS
 .DS_Store

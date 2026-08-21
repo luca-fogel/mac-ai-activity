@@ -43,6 +43,23 @@ public enum FreshnessPolicy: Sendable, Equatable {
     /// Push. Events arrive only when work happens, so quiet is `absent`
     /// (nothing is happening), never `stale` (something is wrong).
     case eventDriven(quietAfter: Double)
+
+    /// How the /slots channel should be judged for a given engine.
+    ///
+    /// Not uniform, because the channel is not the same kind of thing on every
+    /// engine. Bionic's is polled at a fixed 1 Hz whenever the server is up, so
+    /// silence there means something broke. Jan's is polled ONLY while a request
+    /// is actually in a slot — deliberately, since that is what keeps the cost
+    /// of watching an idle Jan at zero — so between generations there is nothing
+    /// to report, and judging it as a missed poll put an amber `stale` chip on a
+    /// perfectly healthy idle server. Quiet there means idle, which is exactly
+    /// what `eventDriven` exists to express.
+    public static func slots(for engine: EngineID) -> FreshnessPolicy {
+        switch engine {
+        case .jan: return .eventDriven(quietAfter: 300)
+        default:   return .polled(expected: 1.0)
+        }
+    }
 }
 
 /// Everything the decision needs, gathered by the caller.

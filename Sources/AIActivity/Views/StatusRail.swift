@@ -9,7 +9,9 @@ struct StatusRail: View {
     // The runtime actually doing the work -- NOT necessarily the one with an
     // HTTP API. Bionic can host llama.cpp and MLX at once, and only llama.cpp
     // exposes /slots.
-    private var bionic: RuntimeInfo? { hub.workingRuntime }
+    /// Whichever engine is actually working — not necessarily llama.cpp, and
+    /// under Jan not necessarily the process that owns the port.
+    private var working: RuntimeInfo? { hub.workingRuntime }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -20,6 +22,7 @@ struct StatusRail: View {
                 memTile
                 powerTile
                 thermalTile
+                fanTile
                 Spacer(minLength: 8)
                 jouleTile
             }
@@ -40,23 +43,29 @@ struct StatusRail: View {
         .padding(.horizontal, T.padSection)
         .padding(.vertical, 10)
         .background(T.surface)
-        .onChange(of: bionic?.generation?.pid) { _, _ in refreshFacts() }
+        .onChange(of: working?.generation?.pid) { _, _ in refreshFacts() }
         .onAppear { refreshFacts() }
     }
 
     private var modelChip: some View {
         HStack(spacing: 7) {
             Circle()
-                .fill(hub.isGenerating ? EngineID.bionic.hue : T.inkDisabled)
+                // The generating engine's own hue. Pinned to Bionic's blue, a
+                // Jan generation lit up in another engine's colour.
+                .fill(hub.isGenerating
+                      ? (working?.engine.hue ?? EngineID.bionic.hue)
+                      : T.inkDisabled)
                 .frame(width: 7, height: 7)
             VStack(alignment: .leading, spacing: 1) {
-                Text(bionic?.modelName.map(shorten) ?? "no model resident")
+                Text(working?.modelName.map(shorten) ?? "no model resident")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(bionic == nil ? T.inkDisabled : T.inkPrimary)
+                    .foregroundStyle(working == nil ? T.inkDisabled : T.inkPrimary)
                 HStack(spacing: 5) {
-                    if let b = bionic?.backend { Chip(text: b, tint: T.engineBionic) }
-                    if let q = bionic?.quantization { Chip(text: q) }
-                    if let s = bionic?.speculativeType { Chip(text: "spec \(s)") }
+                    if let b = working?.backend {
+                        Chip(text: b, tint: working?.engine.hue ?? T.engineBionic)
+                    }
+                    if let q = working?.quantization { Chip(text: q) }
+                    if let s = working?.speculativeType { Chip(text: "spec \(s)") }
                     Text(stateWord)
                         .font(.system(size: 10)).foregroundStyle(T.inkMuted)
                     if hub.residentRuntimes.count > 1 {
@@ -87,7 +96,7 @@ struct StatusRail: View {
     }
 
     private var staticFacts: String {
-        guard let b = bionic else { return "No model resident." }
+        guard let b = working else { return "No model resident." }
         var l: [String] = []
         if let m = b.modelName { l.append(m) }
         if let p = b.paramCount { l.append("\(p / 1_000_000_000) B parameters") }
@@ -136,13 +145,50 @@ struct StatusRail: View {
         return "held \(String(format: "%.0f", max(0, held)))s" + (p.onAC ? " · on AC" : "")
     }
 
+    /// The hotspot, NOT "CPU temperature".
+    ///
+    /// During GPU-bound inference — which is what local inference is — the CPU
+    /// clusters are power-gated and their sensors read 12–23 °C while the GPU
+    /// sits at 82 °C. A CPU-labelled headline would FALL as the machine got
+    /// hotter, so this tile always says which domain it is quoting.
     private var thermalTile: some View {
-        let s = hub.latestSystem
-        return MetricTile(label: "Thermal",
-                          value: s?.thermal.rawValue ?? Fmt.dash,
-                          tint: s?.thermal.tint ?? T.inkDisabled,
-                          caption: hub.latestPower.flatMap { $0.batteryTempC }
-                            .map { String(format: "batt %.1f °C · sensor, not SoC", $0) })
+        let th = hub.latestThermal
+        let hot = th?.hotspot
+        return MetricTile(
+            label: "Hotspot",
+            value: hot?.estimate.value.map { Fmt.celsius($0, decimals: 1) } ?? Fmt.dash,
+            tint: hotTint(hot?.estimate.value),
+            caption: hot.map { "\($0.domain.displayName) · \(th?.pressure.rawValue ?? "")" }
+                ?? th.map { "no die sensor · \($0.pressure.rawValue)" }
+                ?? "SMC not read yet")
+        .help("""
+        Hottest die sensor across the CPU and GPU clusters, from the SMC.
+        Power-gated clusters are excluded rather than reported as cold.
+        The battery sensor is a separate reading: \(hub.latestPower?.batteryTempC.map { String(format: "%.1f °C", $0) } ?? "—").
+        """)
+    }
+
+    private func hotTint(_ c: Double?) -> Color {
+        guard let c else { return T.inkDisabled }
+        if c >= 95 { return T.critical }
+        if c >= 85 { return T.serious }
+        return T.inkPrimary
+    }
+
+    /// Fans earn a tile only because control exists: when the app is holding a
+    /// fan, that fact has to be visible from every tab, not just the one with
+    /// the slider on it.
+    private var fanTile: some View {
+        let th = hub.latestThermal
+        let rpm = th?.fans.compactMap { $0.actualRPM }.max()
+        let forced = th?.control?.forcing ?? false
+        return MetricTile(
+            label: "Fans",
+            value: Fmt.rpm(rpm),
+            tint: forced ? T.warning : T.inkPrimary,
+            caption: forced
+                ? "held by this app · lease \(th?.control?.leaseRemaining.map { String(format: "%.0fs", $0) } ?? "—")"
+                : (th?.fans.isEmpty == false ? "SMC automatic" : nil))
     }
 
     /// The hero metric gets a permanent home so it is never off-screen.

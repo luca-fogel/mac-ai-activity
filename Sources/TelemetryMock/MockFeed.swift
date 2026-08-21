@@ -147,6 +147,65 @@ public final class MockFeed: TelemetryFeed, @unchecked Sendable {
                     ])))
                 }
 
+                // The thermal domain, at its real 1 Hz. Scripted so the states
+                // that matter are reachable without a hot machine: a parked CPU
+                // cluster while the GPU is loaded, fans held by the app, and a
+                // safety trip.
+                if i % 10 == 0 {
+                    let heat = generating ? min(1, (cyc - 6) / 25) : max(0, 1 - (cyc / 6))
+                    let gpuC = 48 + 38 * heat
+                    // The CPU clusters gate off during GPU-bound work, and their
+                    // sensors then read far BELOW ambient. This is the trap the
+                    // parked-floor rule exists for, so the mock reproduces it.
+                    let cpuC = generating ? 18.0 : 52.0 + 6 * heat
+                    let parkedCPU = generating
+                    let fanRPM = 2200 + 2600 * heat
+                    let forcing = generating && cyc > 12
+                    cont.yield(.thermal(ThermalSample(
+                        t: t,
+                        groups: [
+                            SensorGroup(
+                                domain: .cpuPerformance,
+                                live: parkedCPU ? [] : (0..<8).map { ("Tp0\($0)", cpuC + Double($0) * 0.4) },
+                                parked: parkedCPU ? (0..<8).map { ("Tp0\($0)", cpuC + Double($0) * 0.3) } : []),
+                            SensorGroup(domain: .cpuEfficiency,
+                                        live: [("Te04", 54 + 8 * heat), ("Te05", 57 + 8 * heat)],
+                                        parked: []),
+                            SensorGroup(domain: .gpu,
+                                        live: (0..<6).map { ("Tg0\($0)", gpuC - Double($0) * 1.1) },
+                                        parked: []),
+                            SensorGroup(domain: .battery, live: [("TB0T", 31.5)], parked: []),
+                        ],
+                        fans: [
+                            FanSample(index: 0, actualRPM: heat < 0.05 ? 0 : fanRPM,
+                                      targetRPM: forcing ? 4200 : fanRPM,
+                                      minRPM: 2317, maxRPM: 6800,
+                                      mode: forcing ? .forced : .auto),
+                            FanSample(index: 1, actualRPM: heat < 0.05 ? 0 : fanRPM + 180,
+                                      targetRPM: forcing ? 4200 : fanRPM + 180,
+                                      minRPM: 2317, maxRPM: 6800,
+                                      mode: forcing ? .forced : .auto),
+                        ],
+                        pressure: heat > 0.8 ? .serious : (generating ? .fair : .nominal),
+                        pressureSince: Instant(t.s - 4),
+                        speedLimit: .unavailable("Apple Silicon publishes no CPU_Speed_Limit"),
+                        sampleCostMicros: 13_100,
+                        sensorsRead: 67,
+                        control: CoolingStatus(
+                            helperVersion: "1.0", forcing: forcing,
+                            targets: forcing ? [0: 4200, 1: 4200] : [:],
+                            leaseRemaining: forcing ? 11 : nil,
+                            lastClamp: nil,
+                            trip: heat > 0.9 ? .overTemperature : nil,
+                            tripUntil: heat > 0.9 ? 45 : nil,
+                            hardCeilingC: 95,
+                            limits: [0: [2317, 6800], 1: [2317, 6800]],
+                            hotspotC: max(gpuC, cpuC)))))
+                    cont.yield(.health(SourceHealth(source: .thermal, engine: nil, t: t,
+                                                    outcome: .ok, latency: 0.0131,
+                                                    sincePreviousOK: 1.0)))
+                }
+
                 // A retrospective receipt, at the END of a generation — the only
                 // shape this source ever has. Values are a real capture from
                 // qwen/qwen3.8-27b on the embedded MLX engine.

@@ -24,6 +24,11 @@ final class TelemetryHub {
     /// The sparse inference track: one entry per actual /slots response.
     @ObservationIgnored private(set) var rateSeries = Series<Double?>(capacity: 600)
     @ObservationIgnored private(set) var wattSeries = Series<Double?>(capacity: 300)
+    /// Die hotspot and fan rpm, 1 Hz. Their own series because they are their
+    /// own domain: 1 Hz against the system domain's 10 Hz, and never resampled
+    /// onto it.
+    @ObservationIgnored private(set) var tempSeries = Series<Double?>(capacity: 600)
+    @ObservationIgnored private(set) var fanSeries = Series<Double?>(capacity: 600)
 
     /// The single observed value. Replaced once per flush, so a view that
     /// reads anything through it is invalidated exactly once per redraw.
@@ -39,6 +44,7 @@ final class TelemetryHub {
         /// it describes a generation that has ALREADY FINISHED and must never be
         /// rendered where a live reading goes.
         var lastPrediction: [EngineID: PredictionSample] = [:]
+        var thermal: ThermalSample?
         var revision: Int = 0
         var slotPollCount = 0
         var slotServerMillis: Double = 0
@@ -55,6 +61,10 @@ final class TelemetryHub {
     }
     var inferenceByEngine: [EngineID: InferenceSample] { snapshot.inference }
     var latestPower: PowerSample? { snapshot.power }
+    var latestThermal: ThermalSample? { snapshot.thermal }
+    /// The helper's live view, or nil when there is no helper — which is the
+    /// app's default, read-only state and not a fault.
+    var cooling: CoolingStatus? { snapshot.thermal?.control }
     /// Newest receipt from any engine. Newest-first, and always about the past.
     var lastPrediction: PredictionSample? {
         snapshot.lastPrediction.values.max { $0.t < $1.t }
@@ -115,6 +125,19 @@ final class TelemetryHub {
                 self.flush()
             }
         }
+    }
+
+    /// Mirrors the controller's policy so the UI has something observable to
+    /// bind to. The controller remains the source of truth — this is a copy,
+    /// and it is written only here.
+    private(set) var coolingPolicy: CoolingPolicy = .system
+
+    var coolingAvailable: Bool { feed?.cooling?.isInstalled ?? false }
+    var coolingError: String? { feed?.cooling?.error }
+
+    func setCoolingPolicy(_ p: CoolingPolicy) {
+        coolingPolicy = p
+        feed?.cooling?.setPolicy(p)
     }
 
     func setCadence(_ m: CadenceMode) {
@@ -192,6 +215,16 @@ final class TelemetryHub {
                                 at: v.t)
             episodes = tracker.completed
             currentEpisode = tracker.current
+        case .thermal(let v):
+            tempSeries.append(t: v.t.s, v.hotspot?.estimate.value)
+            fanSeries.append(t: v.t.s, v.fans.compactMap { $0.actualRPM }.max())
+            pending.thermal = v
+            tracker.noteThermal(hotspotC: v.hotspot?.estimate.value,
+                                domain: v.hotspot?.domain,
+                                fanRPM: v.fans.compactMap { $0.actualRPM }.max(),
+                                fansForced: v.control?.forcing ?? false,
+                                pressure: v.pressure,
+                                at: v.t)
         case .health(let h):
             sources.ingest(h)
         }
@@ -226,16 +259,37 @@ final class TelemetryHub {
     /// The runtime actually doing the work, which is NOT necessarily the one
     /// with an HTTP API. Showing llama.cpp's model name while MLX is generating
     /// was the app reporting a stale identity as if it were live.
+    /// The row that best DESCRIBES an engine, where an engine has several.
+    ///
+    /// Jan contributes a router row, a row per loaded instance and a row per
+    /// model it could load. The router is listed first and holds no weights, so
+    /// taking the first match reported "no model resident" in the header — and
+    /// an absent inference domain — throughout a generation that was visibly
+    /// running. Rank by what the row can actually tell us instead of by
+    /// position: generating beats resident, resident beats merely present.
+    func bestRuntime(for engine: EngineID) -> RuntimeInfo? {
+        let rows = roster.filter { $0.engine == engine }
+        if rows.count <= 1 { return rows.first }
+        return rows.max { a, b in
+            func rank(_ r: RuntimeInfo) -> (Int, Int, UInt64) {
+                ((r.busy && r.modelName != nil) ? 1 : 0,
+                 (r.reachable && r.modelName != nil) ? 1 : 0,
+                 r.residentBytes)
+            }
+            return rank(a) < rank(b)
+        }
+    }
+
     var workingRuntime: RuntimeInfo? {
         // 1. The engine we can SEE generating wins, whichever it is.
-        if let e = activeEngine, let r = roster.first(where: { $0.engine == e }) { return r }
+        if let e = activeEngine, let r = bestRuntime(for: e) { return r }
         // 2. A runtime that reports busy but exposes no token detail (MLX in Bionic).
         if let r = roster.first(where: { $0.busy }) { return r }
         // 3. Idle: the engine that ran MOST RECENTLY. "Biggest resident" is not
         //    the same question, and answering it here pinned the header to
         //    llama.cpp's 21 GB model no matter what you had actually been using.
         if let e = lastBusyAt.max(by: { $0.value < $1.value })?.key,
-           let r = roster.first(where: { $0.engine == e }) { return r }
+           let r = bestRuntime(for: e) { return r }
         // 4. Nothing has run since the app launched (and nothing is persisted,
         //    by design). Prefer the most RECENTLY STARTED runtime: the server
         //    you brought up last is the one you are working with. Ranking by
@@ -265,7 +319,7 @@ final class TelemetryHub {
             return .absent(runtime.telemetryGap ?? "no per-token telemetry")
         }
         return sources.liveness(.slots, runtime.engine, now: now,
-                                policy: .polled(expected: 1.0))
+                                policy: .slots(for: runtime.engine))
     }
 
     /// A prediction completed, but no episode was ever opened for it.

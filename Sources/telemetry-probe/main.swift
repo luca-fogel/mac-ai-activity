@@ -72,6 +72,92 @@ if args.contains("--predictions") {
     exit(0)
 }
 
+// Proves the whole Jan path against a live Jan: three-tier discovery, the
+// environment-borne API key, the auth-free catalogue, and the log stream that
+// replaces polling. Prints what is measurable and what is not, and never sends
+// a request that could make the router load a model.
+if args.contains("--jan") {
+    let sem = DispatchSemaphore(value: 0)
+    Task.detached {
+        let registry = EndpointRegistry()
+        _ = await registry.refresh()
+        guard let top = await registry.janTopology() else {
+            print("Jan's llama.cpp engine is not running (no router process found).")
+            print("A running Jan.app with no engine started is expected to print this.")
+            sem.signal(); return
+        }
+
+        print("ROUTER   pid \(top.routerPID)  \(top.routerHost):\(top.routerPort)"
+              + "  models-max \(top.facts.modelsMax.map(String.init) ?? "—")")
+        print("KEY      \(top.key == nil ? "NOT FOUND — /slots and /props will 401" : "found in router env (\(top.key!))")")
+        print("HAZARD   \(JanTopology.loadHazard)")
+        print("METRICS  \(JanTopology.metricsGap)")
+
+        let router = JanRouterClient(host: top.routerHost, port: top.routerPort)
+        do {
+            print("HEALTH   \(try await router.health() ? "ok" : "not ok")   (unauthenticated)")
+            for c in try await router.catalogue() {
+                print("CATALOG  \(c.id)  \(c.residency.rawValue)"
+                      + "  ctx/slot \(c.facts.allocatedSlotContext.map(String.init) ?? "—")"
+                      + (c.isEmbedding ? "  [embeddings]" : ""))
+            }
+        } catch { print("CATALOG  failed: \(error)") }
+
+        for i in top.instances {
+            let ru = ProcSampler.rusage(i.pid)
+            print("INSTANCE \(i.alias)  pid \(i.pid)  port \(i.port)"
+                  + "  slots \(i.facts.parallelSlots.map(String.init) ?? "—")"
+                  + "  ctx/slot \(i.facts.allocatedSlotContext.map(String.init) ?? "—")"
+                  + "  footprint \(gib(ru?.ri_phys_footprint ?? 0))"
+                  + (i.isEmbedding ? "  [embeddings]" : ""))
+        }
+        if top.instances.isEmpty { print("INSTANCE (none loaded — the router is idle)") }
+
+        let log = JanLogStream()
+        guard log.exists else {
+            print("LOG      missing at \(log.path) — no push telemetry")
+            sem.signal(); return
+        }
+        print("LOG      \(log.path)")
+        print("\nwatching — drive a generation in Jan (Ctrl-C to stop)\n")
+        while true {
+            let snap = log.poll(now: Instant.now())
+            for (port, st) in snap.instances.sorted(by: { $0.key < $1.key }) where st.decoding {
+                print(String(format: "LIVE  %-24@ port %d slot %@  n_decoded %@  tg %@  tg_3s %@",
+                    st.alias ?? "?", Int(port),
+                    st.slotID.map(String.init) ?? "—",
+                    st.nDecoded.map(String.init) ?? "—",
+                    st.tokensPerSecond.map { String(format: "%.2f", $0) } ?? "—",
+                    st.tokensPerSecond3s.map { String(format: "%.2f", $0) } ?? "—"))
+            }
+            for (port, st) in snap.instances.sorted(by: { $0.key < $1.key }) {
+                if let p = st.loadProgress {
+                    print(String(format: "LOAD  %-24@ port %d  %.0f%%",
+                                 st.alias ?? "?", Int(port), p * 100))
+                }
+            }
+            for r in snap.receipts {
+                print("RCPT  \(r.alias ?? "?")  slot \(r.slotID.map(String.init) ?? "—")")
+                print(String(format: "        prefill %@ tok in %@ ms  (%@ tok/s)  -> TTFT %@ s EXACT",
+                    r.promptTokens.map(String.init) ?? "—",
+                    r.promptMillis.map { String(format: "%.2f", $0) } ?? "—",
+                    r.promptTokensPerSecond.map { String(format: "%.2f", $0) } ?? "—",
+                    r.timeToFirstToken.map { String(format: "%.4f", $0) } ?? "—"))
+                print(String(format: "        decode  %@ tok in %@ ms  (%@ tok/s)  ctx %@  truncated %@  graphs reused %@",
+                    r.decodedTokens.map(String.init) ?? "—",
+                    r.decodeMillis.map { String(format: "%.2f", $0) } ?? "—",
+                    r.decodeTokensPerSecond.map { String(format: "%.2f", $0) } ?? "—",
+                    r.contextTokens.map(String.init) ?? "—",
+                    r.truncated.map(String.init) ?? "—",
+                    r.graphsReused.map(String.init) ?? "—"))
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+    }
+    sem.wait()
+    exit(0)
+}
+
 if args.contains("--live") {
     let feed = LiveTelemetryFeed()
     let sem = DispatchSemaphore(value: 0)
@@ -100,6 +186,15 @@ if args.contains("--live") {
                 print(String(format: "INF  %@ poll %6.1f ms  repairs %d", s.engine.displayName, s.pollDuration * 1000, s.malformedRepairs))
                 for sl in s.slots {
                     let ctx = sl.nPromptTokens.map { npt -> String in
+                        // When the window is known exactly there is one ratio,
+                        // and calling n_ctx the "reported max" would be wrong:
+                        // under a router child with auto-fit off it IS the
+                        // allocation.
+                        if let w = sl.context.allocatedWindow.value {
+                            let trainable = sl.nCtxTrainable.map { " · model trained for \($0)" } ?? ""
+                            return String(format: "%d/%d = %.1f%% of the allocated window%@",
+                                          npt, w, Double(npt)/Double(w)*100, trainable)
+                        }
                         if let fit = sl.nCtxFitted { return String(format: "%d/%d = %.1f%% of fitted (%.1f%% of reported max)", npt, fit, Double(npt)/Double(fit)*100, Double(npt)/Double(sl.nCtxReported)*100) }
                         return "\(npt)/? — fitted window unknown"
                     } ?? "—"
@@ -131,6 +226,13 @@ if args.contains("--live") {
 
             case .roster(let r):
                 print("ROS  " + r.runtimes.map { "\($0.engine.displayName)@\($0.endpoint)\($0.modelName.map { m in " [\(m)]" } ?? "")" }.joined(separator: "  "))
+            case .thermal(let th):
+                let hot = th.hotspot.map { String(format: "%@ %.1f C", $0.domain.displayName, $0.estimate.value ?? -1) } ?? "—"
+                let fans = th.fans.map { String(format: "%.0f rpm[%@]", $0.actualRPM ?? -1, $0.mode.rawValue) }
+                    .joined(separator: " ")
+                let ctl = th.control.map { $0.forcing ? "FORCED \($0.targets.sorted { $0.key < $1.key }.map { String(format: "%.0f", $0.value) }.joined(separator: "/"))" : "auto" } ?? "no helper"
+                print(String(format: "THRM hotspot %@  fans %@  %@  press %@  sweep %.1f ms/%d sensors",
+                             hot, fans, ctl, th.pressure.rawValue, th.sampleCostMicros / 1000, th.sensorsRead))
             case .health(let h):
                 if !h.outcome.isOK {
                     print("HLTH \(h.source.rawValue)\(h.engine.map { "/\($0.rawValue)" } ?? "") -> \(h.outcome.shortReason)")
@@ -143,6 +245,107 @@ if args.contains("--live") {
         Task { await feed.stop() }
     }
     _ = sem.wait(timeout: .now() + 30)
+    exit(0)
+}
+
+/// Verifies the thermal collector AND its two costs, which differ by 14x.
+///
+/// The distinction is the whole reason the thermal sweep is allowed to read
+/// every sensor every second: it is 13 ms of BLOCKED time and under 1 ms of
+/// CPU, so it is cheap for the machine and expensive only for the thread it
+/// runs on — which is why that thread is its own.
+if args.contains("--thermal") {
+    guard let sensors = ThermalSensors() else {
+        print("no readable SMC die sensors"); exit(1)
+    }
+    print("discovered: " + ThermalDomain.allCases.map {
+        "\($0.displayName) \(sensors.discoveredCounts[$0] ?? 0)"
+    }.joined(separator: "  "))
+
+    // Cost, measured both ways.
+    _ = sensors.sample()
+    let n = 20
+    var wall = 0.0
+    let c0 = ProcessInfo.processInfo.systemUptime
+    var cpu0 = rusage()
+    getrusage(RUSAGE_SELF, &cpu0)
+    for _ in 0..<n {
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        _ = sensors.sample()
+        wall += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+    }
+    var cpu1 = rusage()
+    getrusage(RUSAGE_SELF, &cpu1)
+    func secs(_ r: rusage) -> Double {
+        Double(r.ru_utime.tv_sec) + Double(r.ru_utime.tv_usec) / 1e6
+            + Double(r.ru_stime.tv_sec) + Double(r.ru_stime.tv_usec) / 1e6
+    }
+    let cpuMs = (secs(cpu1) - secs(cpu0)) / Double(n) * 1000
+    _ = c0
+    print(String(format: "sweep: %.1f ms wall, %.2f ms CPU per tick -> %.3f%% of one core at 1 Hz",
+                 wall / Double(n), cpuMs, cpuMs / 10))
+    if cpuMs > 3 { print("FAIL: thermal sweep over CPU budget (3 ms)"); exit(1) }
+
+    for k in 0..<10 {
+        let s = sensors.sample()
+        var line = String(format: "%2d  ", k)
+        for g in s.groups {
+            let v = g.hottest.value.map { String(format: "%5.1f", $0) } ?? "  — "
+            line += String(format: "%@ %@%@  ", g.domain.displayName, v,
+                           g.parked.isEmpty ? "" : " (\(g.parked.count) parked)")
+        }
+        line += s.fans.map { String(format: "| fan%d %.0f/%.0f %@", $0.index,
+                                    $0.actualRPM ?? -1, $0.targetRPM ?? -1, $0.mode.rawValue) }
+            .joined(separator: " ")
+        print(line)
+        Thread.sleep(forTimeInterval: 1.0)
+    }
+
+    let c = CoolingClient()
+    print("\nhelper installed: \(c.isInstalled)")
+    if c.isInstalled {
+        do {
+            let st = try c.status()
+            print("helper v\(st.helperVersion) forcing=\(st.forcing) ceiling \(Int(st.hardCeilingC)) C "
+                  + "limits \(st.limits.sorted { $0.key < $1.key }.map { "fan\($0.key) \(Int($0.value[0]))-\(Int($0.value[1]))" }.joined(separator: " "))")
+        } catch {
+            print("helper unreachable: \(CoolingController.describe(error))")
+        }
+    } else {
+        print("(read-only — install with tools/install-cooling-helper.sh to enable control)")
+    }
+    print("PASS")
+    exit(0)
+}
+
+/// Documents the privilege boundary by walking into it.
+///
+/// Reads are expected to work as a normal user; the write is a NO-OP — it
+/// writes back the value `F0Md` already holds — purely to observe which result
+/// byte the SMC returns to an unprivileged caller. That code is the entire
+/// reason `aithermald` exists, so it is asserted rather than assumed.
+if args.contains("--smc") {
+    guard let smc = SMC() else { print("cannot open AppleSMC"); exit(1) }
+    let keys = smc.allKeys()
+    print("AppleSMC open · \(keys.count) keys enumerated as uid \(getuid())")
+    for k in ["#KEY", "FNum", "F0Md", "F0Ac", "F0Mn", "F0Mx", "Tg0X"] {
+        let info = smc.info(k)
+        let v = smc.readNumber(k)
+        print(String(format: "  %-5@ %-5@ %@", k, info?.type ?? "—",
+                     v.map { String(format: "%.2f", $0) } ?? "unreadable"))
+    }
+    guard let mode = smc.readNumber("F0Md") else { print("F0Md unreadable"); exit(1) }
+    print(String(format: "\nno-op write: F0Md <- %.0f (the value it already holds)", mode))
+    let r = smc.write("F0Md", bytes: SMC.encodeUInt8(UInt8(mode)))
+    print("  result: \(r) — \(r.reason)")
+    if getuid() == 0 {
+        guard r == .ok else { print("FAIL: root write refused"); exit(1) }
+    } else {
+        guard r == .notPrivileged else {
+            print("UNEXPECTED: an unprivileged write was not refused with 0x85."); exit(1)
+        }
+    }
+    print("PASS")
     exit(0)
 }
 

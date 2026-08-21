@@ -28,6 +28,16 @@ enum T {
     static let engineBionic  = Color(hex: 0x3987E5)
     static let engineLocalAI = Color(hex: 0x199E70)
     static let engineOllama  = Color(hex: 0xC98500)
+    /// Jan. Added as a FOURTH categorical hue rather than shared, because Jan
+    /// and Bionic are both llama.cpp holding multi-GB models and can be
+    /// resident simultaneously, so they are the one pair that must never be
+    /// confusable. Checked the same way as the other three: simulated under
+    /// deuteranopia, protanopia and tritanopia, its worst-case CIELAB
+    /// separation from all three existing hues is dE 25.4 — above the dE 15.7
+    /// floor the surviving trio already sits at (green vs amber under
+    /// tritanopia). L* 55 puts it in the same lightness band (56/58/61), so it
+    /// carries no more visual weight than its neighbours.
+    static let engineJan     = Color(hex: 0xAA6EAA)
 
     // MARK: Phase — PLOT AREAS ONLY.
     static let phasePrefill = Color(hex: 0xD95926)
@@ -86,16 +96,22 @@ extension Color {
 }
 
 extension EngineID {
-    /// Only three categorical hues survived CVD validation against this
-    /// surface, so mlx-lm shares yellow with Ollama. They never compete for it
-    /// in practice: hue is earned by residency, and Ollama on this machine is
-    /// embeddings-only and holds nothing, so it always renders muted.
+    /// Four categorical hues, and mlx-lm still shares yellow with Ollama. They
+    /// never compete for it in practice: hue is earned by residency, and Ollama
+    /// on this machine is embeddings-only and holds nothing, so it always
+    /// renders muted.
+    ///
+    /// Jan is the one that could NOT share. It is llama.cpp, like Bionic, and
+    /// both hold multi-GB models — so on a machine running both, a shared hue
+    /// would put two heavyweight engines under one colour precisely when
+    /// telling them apart matters most.
     var hue: Color {
         switch self {
         case .bionic:  return T.engineBionic
         case .localai: return T.engineLocalAI
         case .ollama:  return T.engineOllama
         case .mlxlm:   return T.engineOllama
+        case .jan:     return T.engineJan
         }
     }
 }

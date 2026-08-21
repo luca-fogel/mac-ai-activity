@@ -31,7 +31,9 @@ struct MenuBarReadout: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(hub.roster.first { $0.engine == .bionic }?.modelName?
+            // The engine that is actually working. Pinned to Bionic, the menu
+            // bar read "No model resident" through every Jan generation.
+            Text(hub.workingRuntime?.modelName?
                     .replacingOccurrences(of: ".gguf", with: "") ?? "No model resident")
                 .font(.system(size: 12, weight: .semibold))
             HStack(spacing: T.padSection) {

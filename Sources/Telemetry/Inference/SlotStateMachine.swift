@@ -50,7 +50,10 @@ public struct SlotStateMachine: Sendable {
 
     public mutating func update(_ raw: LlamaSlotsClient.RawSlot,
                                 at t: Instant,
-                                fittedContext: Int?) -> SlotSample {
+                                fittedContext: Int?,
+                                allocatedContext: Int? = nil,
+                                trainableContext: Int? = nil,
+                                instance: String? = nil) -> SlotSample {
 
         // ---- classify. The three payload shapes are genuinely different. ----
         var tr = tracks[raw.id] ?? Track()
@@ -79,6 +82,29 @@ public struct SlotStateMachine: Sendable {
                       raw.nPromptTokensProcessed == lp,
                       let last = tr.lastDecoded, d > last, d < 64 {
                 tr.decodeTrusted = true
+            } else if let lp = tr.lastProcessed,
+                      raw.nPromptTokensProcessed == lp,
+                      let lastPT = tr.lastPromptTokens,
+                      let pt = raw.nPromptTokens, pt > lastPT {
+                // Prefill has STOPPED (processed is frozen) while the total
+                // context is still GROWING. Only emitted tokens can do that, so
+                // decode has begun regardless of what n_decoded happens to read.
+                //
+                // Needed because both signals above require catching the
+                // counter early, and on a fast model there is no early to
+                // catch. MEASURED against Jan running a 4B at ~72 tok/s: prefill
+                // took 128 ms, so it was over before the first 1 Hz poll —
+                // the stale value was never observed, so no reset could be seen
+                // (signal one), and by the first reading n_decoded was already
+                // past 64 (signal two). The slot therefore stayed `prefilling`
+                // for the entire generation and no live decode rate was ever
+                // published for a server that was plainly decoding. This third
+                // signal needs no luck: it only needs two consecutive polls.
+                tr.decodeTrusted = true
+                // The counter was never established as trustworthy before now,
+                // so anything already recorded may be the previous request's.
+                tr.lastDecoded = nil
+                tr.window.removeAll()
             }
         }
         if raw.isProcessing {
@@ -144,6 +170,8 @@ public struct SlotStateMachine: Sendable {
         return SlotSample(
             id: raw.id, state: state,
             nCtxReported: raw.nCtx, nCtxFitted: fittedContext,
+            nCtxAllocated: allocatedContext, nCtxTrainable: trainableContext,
+            instance: instance,
             speculative: raw.speculative, specTypes: raw.specTypes, idTask: raw.idTask,
             nPromptTokens: raw.nPromptTokens,
             nPromptTokensProcessed: raw.nPromptTokensProcessed,
