@@ -197,11 +197,13 @@ persisted to disk and nothing leaves the machine.
 
 ## See also
 
-[**llmctl**](https://github.com/foggylulu/llmctl) — the same machine's *memory*
-rather than its inference behaviour: which engines are holding RAM, which idle
-server processes are still pinning weights with `mlock`, and one command to get
-it back. This app answers "what did that generation cost"; that one answers
-"what is holding my RAM".
+- [**llmctl**](https://github.com/foggylulu/llmctl) — the same machine's *memory*
+  rather than its inference behaviour: which engines are holding RAM, which idle
+  server processes are still pinning weights with `mlock`, and one command to get
+  it back. This app answers "what did that generation cost"; that one answers
+  "what is holding my RAM".
+- [**qwen-control-mac**](https://github.com/foggylulu/qwen-control-mac) — powering
+  a large local model on and off remotely over Tailscale, from a phone.
 
 ## Documentation
 
