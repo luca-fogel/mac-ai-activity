@@ -202,8 +202,8 @@ persisted to disk and nothing leaves the machine.
   server processes are still pinning weights with `mlock`, and one command to get
   it back. This app answers "what did that generation cost"; that one answers
   "what is holding my RAM".
-- [**qwen-control-mac**](https://github.com/foggylulu/qwen-control-mac) — powering
-  a large local model on and off remotely over Tailscale, from a phone.
+- [**wake-on-llm**](https://github.com/foggylulu/wake-on-llm) — powering a large
+  local model on and off remotely over Tailscale, from a phone.
 
 ## Documentation
 
