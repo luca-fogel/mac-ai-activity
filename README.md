@@ -223,6 +223,10 @@ Every trap described in the notes has a test. The fan-control guard in
 particular is pure functions over values, so every release path is exercised
 without overheating a laptop.
 
+- [**solvr-ai**](https://github.com/foggylulu/solvr-ai) — a maths tutor app for
+  iOS and macOS that runs against a hosted API, a local server, or Apple's
+  on-device model, and measures the difference.
+
 ## License
 
 **GPL-3.0** — see [LICENSE](LICENSE).
