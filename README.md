@@ -90,7 +90,7 @@ state.
 ## Install
 
 ```sh
-git clone https://github.com/foggylulu/mac-ai-activity.git
+git clone https://github.com/luca-fogel/mac-ai-activity.git
 cd mac-ai-activity
 ./build.sh              # build + ad-hoc sign + install to ~/Applications
 open -a "AI Activity"
@@ -197,12 +197,12 @@ persisted to disk and nothing leaves the machine.
 
 ## See also
 
-- [**llmctl**](https://github.com/foggylulu/llmctl) — the same machine's *memory*
+- [**llmctl**](https://github.com/luca-fogel/llmctl) — the same machine's *memory*
   rather than its inference behaviour: which engines are holding RAM, which idle
   server processes are still pinning weights with `mlock`, and one command to get
   it back. This app answers "what did that generation cost"; that one answers
   "what is holding my RAM".
-- [**wake-on-llm**](https://github.com/foggylulu/wake-on-llm) — powering a large
+- [**wake-on-llm**](https://github.com/luca-fogel/wake-on-llm) — powering a large
   local model on and off remotely over Tailscale, from a phone.
 
 ## Documentation
@@ -223,7 +223,7 @@ Every trap described in the notes has a test. The fan-control guard in
 particular is pure functions over values, so every release path is exercised
 without overheating a laptop.
 
-- [**solvr-ai**](https://github.com/foggylulu/solvr-ai) — a maths tutor app for
+- [**solvr-ai**](https://github.com/luca-fogel/solvr-ai) — a maths tutor app for
   iOS and macOS that runs entirely on Apple's on-device model: no API key, no
   server, no network.
 
