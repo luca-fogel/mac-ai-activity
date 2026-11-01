@@ -19,10 +19,12 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - name: Toolchain
         run: swift --version
       - name: Test Telemetry package
         run: swift test --scratch-path .build/ci
+      - name: Reject unsafe privileged-helper paths
+        run: python3 -m unittest discover -s tools/tests -v

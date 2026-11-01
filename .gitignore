@@ -13,3 +13,7 @@ Resources/AppIcon.icns
 
 # macOS
 .DS_Store
+
+# Python installer regression checks
+__pycache__/
+*.pyc

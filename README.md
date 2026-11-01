@@ -108,6 +108,12 @@ sudo ./tools/install-cooling-helper.sh --selftest   # exercise the write path on
 sudo ./tools/install-cooling-helper.sh --uninstall
 ```
 
+The installer puts the root helper in
+`/Library/PrivilegedHelperTools/com.foggylulu.aithermald` and rejects writable
+or symlinked installation directories. After pulling an update, rerun the
+install command to rebuild and replace an existing helper. Existing installs
+are not updated by a source checkout alone.
+
 Everything else works read-only without it. **Fan writes are refused by the
 kernel on my machine, so the helper ships unverified against real hardware** —
 its guard logic is fully tested, but no successful fan write has ever been
@@ -216,7 +222,7 @@ persisted to disk and nothing leaves the machine.
 ## Tests
 
 ```sh
-swift test    # 225 tests, no hardware or running engine required
+swift test    # 229 tests, no hardware or running engine required
 ```
 
 Every trap described in the notes has a test. The fan-control guard in

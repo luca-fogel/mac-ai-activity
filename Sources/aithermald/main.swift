@@ -133,6 +133,7 @@ final class Daemon {
     private var tripUntil: Double?
     private var stuckSince: [Int: Double] = [:]
     private var hotspotC: Double?
+    private var lastGuardUptime: Double = 0
     /// Last pressure read by the guard loop. A `set` request must not trigger a
     /// second 13 ms sweep of its own — the guard's reading is at most 1 s old,
     /// which is far inside the thermal time constant it is defending against.
@@ -157,16 +158,12 @@ final class Daemon {
         guard bindSocket() else { return 1 }
         defer { cleanup() }
 
-        var lastGuard = now()
+        serviceGuard()
         while !stopRequested {
             // 250 ms so a stop signal is acted on promptly; the guard itself
             // runs on its own 1 s clock regardless of client traffic.
             acceptOnce(timeout: 0.25)
-            let t = now()
-            if t - lastGuard >= 1.0 {
-                lastGuard = t
-                guardTick(at: t)
-            }
+            serviceGuard()
         }
         log("stop requested")
         return 0
@@ -184,6 +181,16 @@ final class Daemon {
     }
 
     // MARK: The deadman
+
+    /// Also called by nonblocking socket waits, so a partial request or a peer
+    /// that stops reading a response cannot pause thermal and lease checks.
+    private func serviceGuard() {
+        let uptime = ProcessInfo.processInfo.systemUptime
+        if uptime - lastGuardUptime >= 1.0 {
+            lastGuardUptime = uptime
+            guardTick(at: now())
+        }
+    }
 
     private func guardTick(at t: Double) {
         let s = sensors.sample()
@@ -286,10 +293,8 @@ final class Daemon {
         guard fd >= 0 else { return }
         defer { close(fd) }
 
-        // A client that connects and then says nothing must not wedge the loop.
-        var tv = timeval(tv_sec: 2, tv_usec: 0)
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var noSigPipe: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
 
         var peerUID: uid_t = 0
         var peerGID: gid_t = 0
@@ -303,7 +308,8 @@ final class Daemon {
             return
         }
 
-        guard let line = readLine(fd), let data = line.data(using: .utf8),
+        guard let line = CoolingSocketIO.readLine(fd, service: { self.serviceGuard() }),
+              let data = line.data(using: .utf8),
               let req = try? JSONDecoder().decode(CoolingRequest.self, from: data) else {
             reply(fd, CoolingResponse(ok: false, error: "malformed request"))
             return
@@ -316,29 +322,10 @@ final class Daemon {
         reply(fd, handle(req))
     }
 
-    private func readLine(_ fd: Int32) -> String? {
-        var data = [UInt8]()
-        var byte: UInt8 = 0
-        while data.count < 64 * 1024 {
-            let n = read(fd, &byte, 1)
-            if n <= 0 { break }
-            if byte == 0x0A { break }
-            data.append(byte)
-        }
-        return data.isEmpty ? nil : String(bytes: data, encoding: .utf8)
-    }
-
     private func reply(_ fd: Int32, _ r: CoolingResponse) {
         guard var out = try? JSONEncoder().encode(r) else { return }
         out.append(0x0A)
-        out.withUnsafeBytes { buf in
-            var off = 0
-            while off < buf.count {
-                let n = write(fd, buf.baseAddress!.advanced(by: off), buf.count - off)
-                if n <= 0 { return }
-                off += n
-            }
-        }
+        CoolingSocketIO.write(fd, data: out, service: { self.serviceGuard() })
     }
 
     // MARK: Requests

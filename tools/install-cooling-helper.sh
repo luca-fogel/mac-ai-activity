@@ -13,7 +13,8 @@ set -euo pipefail
 
 LABEL="com.foggylulu.aithermald"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
-BIN="/usr/local/libexec/aithermald"
+HELPER_DIR="/Library/PrivilegedHelperTools"
+BIN="$HELPER_DIR/$LABEL"
 SOCK="/var/run/aithermald.sock"
 LOG="/var/log/aithermald.log"
 CEILING="${AITHERMALD_CEILING:-95}"
@@ -21,6 +22,8 @@ CEILING="${AITHERMALD_CEILING:-95}"
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 
 die() { echo "error: $*" >&2; exit 1; }
+
+. "$repo/tools/helper-paths.sh"
 
 [[ "$(id -u)" == "0" ]] || die "must run as root — SMC writes are privileged.
   try: sudo $0 ${1:-}"
@@ -33,19 +36,22 @@ OWNER_UID="${SUDO_UID:-0}"
 
 build_binary() {
   local src="$repo/.build/release/aithermald"
-  if [[ ! -x "$src" ]]; then
-    echo "building aithermald (release)..."
-    # Build as the invoking user: SwiftPM must not litter the checkout with
-    # root-owned artefacts.
-    sudo -u "#$OWNER_UID" env HOME="$(eval echo "~#$OWNER_UID")" \
-      swift build -c release --product aithermald --package-path "$repo" >/dev/null
-  fi
+  echo "building aithermald (release)..." >&2
+  # Always rebuild incrementally so an upgrade cannot reuse an older binary.
+  # Build as the invoking user; do not leave root-owned build artefacts.
+  sudo -H -u "#$OWNER_UID" \
+    swift build -c release --product aithermald --package-path "$repo" >/dev/null
   [[ -x "$src" ]] || die "build produced no binary at $src"
   echo "$src"
 }
 
 case "${1:-}" in
 --uninstall)
+  prepare_helper_directory
+  # Install a fresh copy from this checkout rather than executing the old
+  # /usr/local/libexec path, whose ancestors may be writable by another user.
+  src="$(build_binary)"
+  /usr/bin/install -o root -g wheel -m 0755 "$src" "$BIN"
   echo "stopping ${LABEL}..."
   launchctl bootout "system/${LABEL}" 2>/dev/null || true
   # Belt and braces: if the daemon was SIGKILLed, the SMC is still holding
@@ -56,8 +62,10 @@ case "${1:-}" in
   exit 0
   ;;
 --selftest)
+  prepare_helper_directory
   src="$(build_binary)"
-  exec "$src" --selftest --ceiling "$CEILING"
+  /usr/bin/install -o root -g wheel -m 0755 "$src" "$BIN"
+  exec "$BIN" --selftest --ceiling "$CEILING"
   ;;
 "")
   ;;
@@ -67,10 +75,10 @@ case "${1:-}" in
 esac
 
 src="$(build_binary)"
+prepare_helper_directory
 
 echo "installing $BIN"
-install -d -o root -g wheel -m 0755 /usr/local/libexec
-install -o root -g wheel -m 0755 "$src" "$BIN"
+/usr/bin/install -o root -g wheel -m 0755 "$src" "$BIN"
 
 echo "writing $PLIST"
 cat > "$PLIST" <<PLISTEOF
